@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cs-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "LicenseRef-Proprietary"
+authors = ["KChat Authors"]
+
+[workspace.dependencies]
+# kdrive-rust-sdk crates (path deps to sibling repo)
+kchat-drive-types = { path = "../kdrive-rust-sdk/crates/kchat-drive-types" }
+kchat-drive-crypto = { path = "../kdrive-rust-sdk/crates/kchat-drive-crypto" }
+kchat-drive-identity = { path = "../kdrive-rust-sdk/crates/kchat-drive-identity" }
+kchat-drive-mls-bridge = { path = "../kdrive-rust-sdk/crates/kchat-drive-mls-bridge" }
+kchat-drive-sync-core = { path = "../kdrive-rust-sdk/crates/kchat-drive-sync-core" }
+kchat-client-runtime = { path = "../kdrive-rust-sdk/crates/kchat-client-runtime" }
+kchat-drive-store-sqlite = { path = "../kdrive-rust-sdk/crates/kchat-drive-store-sqlite" }
+kchat-drive-transport-core = { path = "../kdrive-rust-sdk/crates/kchat-drive-transport-core" }
+kchat-drive-transport-native = { path = "../kdrive-rust-sdk/crates/kchat-drive-transport-native" }
+
+# Common deps
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+blake3 = "1"
+hkdf = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+minicbor = { version = "0.24", features = ["derive", "alloc"] }
+hex = "0.4"
+base64 = "0.22"
+rand = "0.8"
+zstd = "0.13"
+proptest = { version = "1.5", default-features = false, features = ["std"] }
+tracing = "0.1"
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
+tokio = { version = "1", features = ["rt", "macros", "sync"] }
+
+# SQLCipher
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+
+# Optional ML deps (behind features)
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "tracing", "download-binaries", "copy-dylibs", "api-24", "tls-rustls"] }
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+rustfft = { version = "6.2", default-features = false }
+instant-distance = { version = "0.6", default-features = false }

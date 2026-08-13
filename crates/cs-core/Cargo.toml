@@ -1,0 +1,63 @@
+[package]
+name = "cs-core"
+description = "Platform-agnostic core for KChat chat-storage: E2EE local storage, multilingual search, archive, backup, offload, rehydration — built on kdrive-rust-sdk."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+test-support = []
+onnx = ["dep:ort", "dep:tokenizers", "dep:rustfft", "dep:instant-distance"]
+
+[dependencies]
+# kdrive-rust-sdk crates
+kchat-drive-types = { workspace = true }
+kchat-drive-crypto = { workspace = true }
+kchat-drive-identity = { workspace = true }
+kchat-drive-sync-core = { workspace = true }
+kchat-client-runtime = { workspace = true }
+kchat-drive-transport-core = { workspace = true }
+
+# Common deps
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+blake3 = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+aes-gcm = { workspace = true }
+chacha20poly1305 = { workspace = true }
+zeroize = { workspace = true }
+ed25519-dalek = { workspace = true }
+minicbor = { workspace = true, features = ["derive", "alloc"] }
+hex = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+zstd = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+
+# SQLCipher
+rusqlite = { workspace = true }
+
+# Optional ML deps
+ort = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+rustfft = { workspace = true, optional = true }
+instant-distance = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = "3"
+sha2 = { workspace = true }
+rusqlite = { workspace = true }
+uuid = { workspace = true }
+
+[[test]]
+name = "e2e"
+path = "../../tests/e2e_tests.rs"
