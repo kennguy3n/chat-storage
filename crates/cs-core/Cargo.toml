@@ -9,7 +9,23 @@ authors.workspace = true
 [features]
 default = []
 test-support = []
-onnx = ["dep:ort", "dep:tokenizers", "dep:rustfft", "dep:instant-distance"]
+# ML feature: enables on-device ML via kchat-ai-runtime crates.
+# kchat-encoder provides text embeddings + safety classification (ONNX).
+# kchat-safety provides vision (MobileCLIP-S2) when onnx-runtime-vision is also enabled.
+# kchat-asr provides Whisper audio transcription (ONNX).
+# kchat-core provides EP selection, OCR bridge, inference cache, model manager.
+ml = [
+    "dep:kchat-core",
+    "dep:kchat-encoder",
+    "dep:kchat-safety",
+    "dep:kchat-asr",
+    "kchat-encoder/onnx-runtime",
+    "kchat-safety/onnx-runtime",
+    "kchat-asr/onnx-runtime",
+    "kchat-core/sqlcipher",
+]
+ml-vision = ["ml", "kchat-safety/onnx-runtime-vision"]
+ml-domain-adapters = ["ml", "kchat-encoder/domain-adapters"]
 
 [dependencies]
 # kdrive-rust-sdk crates
@@ -62,11 +78,11 @@ ciborium = { workspace = true }
 # SQLCipher
 rusqlite = { workspace = true }
 
-# Optional ML deps
-ort = { workspace = true, optional = true }
-tokenizers = { workspace = true, optional = true }
-rustfft = { workspace = true, optional = true }
-instant-distance = { workspace = true, optional = true }
+# Optional ML deps — kchat-ai-runtime crates
+kchat-core = { workspace = true, optional = true }
+kchat-encoder = { workspace = true, optional = true }
+kchat-safety = { workspace = true, optional = true }
+kchat-asr = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

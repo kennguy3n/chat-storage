@@ -49,7 +49,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 tokio = { version = "1", features = ["rt", "macros", "sync"] }
 
 # SQLCipher
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+rusqlite = { version = "0.36", features = ["bundled-sqlcipher-vendored-openssl"] }
 
 # Key wrapping (RFC 3394)
 aes-kw = { version = "0.2", default-features = false }
@@ -72,7 +72,14 @@ ciborium = "0.2"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 # Optional ML deps (behind features)
-ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "tracing", "download-binaries", "copy-dylibs", "api-24", "tls-rustls"] }
-tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+# ort is provided transitively by kchat-ai-runtime crates (kchat-encoder, kchat-safety, kchat-asr)
+# which pin ort = "=2.0.0-rc.10" to avoid native-library linking conflicts.
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 rustfft = { version = "6.2", default-features = false }
 instant-distance = { version = "0.6", default-features = false }
+
+# kchat-ai-runtime crates (path deps to sibling repo)
+kchat-core = { path = "../kocal/kchat-ai-runtime/crates/kchat-core" }
+kchat-encoder = { path = "../kocal/kchat-ai-runtime/crates/kchat-encoder" }
+kchat-safety = { path = "../kocal/kchat-ai-runtime/crates/kchat-safety" }
+kchat-asr = { path = "../kocal/kchat-ai-runtime/crates/kchat-asr" }
