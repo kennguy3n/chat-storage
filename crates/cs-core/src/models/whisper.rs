@@ -60,7 +60,7 @@ pub mod kchat {
 
     pub use kchat_asr::backend::{
         AudioTranscriber, MockWhisperTranscriber, SkipWhisperTranscriber, TranscriptionResult,
-        TranscriptionSegment, WhisperBackend, WhisperTranscriber,
+        TranscriptionSegment, WhisperBackend,
     };
 
     /// ONNX Whisper transcriber.
@@ -126,16 +126,6 @@ pub mod kchat {
             mime_type: &str,
         ) -> Result<TranscriptionResult, ModelError> {
             Ok(self.inner.transcribe(audio_data, mime_type)?)
-        }
-    }
-
-    impl WhisperTranscriber for KchatWhisperTranscriber {
-        fn transcribe(
-            &self,
-            audio_data: &[u8],
-            mime_type: &str,
-        ) -> Result<TranscriptionResult, kchat_asr::AsrError> {
-            self.inner.transcribe(audio_data, mime_type)
         }
     }
 }

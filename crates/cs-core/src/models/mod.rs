@@ -52,6 +52,23 @@ impl From<String> for ModelError {
 }
 
 // Bridge: convert kchat-ai-runtime errors into ModelError.
+//
+// Currently covers:
+//   - kchat_encoder::EncoderError (embeddings, safety classification)
+//   - kchat_asr::AsrError (Whisper transcription)
+//   - kchat_core::error::CoreError (OCR bridge, inference cache, EP selection)
+//   - kchat_safety::vision::* (MobileCLIP session, vision encoder, image
+//     preprocessing, frame aggregation — all gated behind ml-vision)
+//
+// NOT covered (not currently used by chat-storage):
+//   - kchat_safety::classify::EncoderError / SlmError
+//   - kchat_safety::skillpack::* (SkillPackError, PassportValidationError, etc.)
+//   - kchat_safety::policy::* (PolicyPackError, ThresholdPolicyError, etc.)
+//   - kchat_safety::policy_interpreter::* (InterpreterError, RateLimiterError, etc.)
+//   - kchat_safety::crypto::* (Ed25519VerifyError, CanonicalJsonError)
+//
+// If chat-storage starts using the classify/skillpack/policy modules,
+// add the corresponding From impls here.
 
 #[cfg(feature = "ml")]
 impl From<kchat_encoder::EncoderError> for ModelError {
@@ -138,5 +155,41 @@ impl From<kchat_safety::vision::VisionImagePreprocessError> for ModelError {
 impl From<kchat_safety::vision::FrameAggregationError> for ModelError {
     fn from(e: kchat_safety::vision::FrameAggregationError) -> Self {
         ModelError::Inference(e.to_string())
+    }
+}
+
+#[cfg(all(test, feature = "ml"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn asr_error_converts_to_model_error() {
+        let err = kchat_asr::AsrError::Ort {
+            op: "test",
+            detail: "test detail".into(),
+        };
+        let model_err: ModelError = err.into();
+        assert!(matches!(model_err, ModelError::Ort { op, .. } if op == "test"));
+    }
+
+    #[test]
+    fn asr_custom_error_converts() {
+        let err = kchat_asr::AsrError::Custom("custom msg".into());
+        let model_err: ModelError = err.into();
+        assert!(matches!(model_err, ModelError::Custom(_)));
+    }
+
+    #[test]
+    fn encoder_error_converts_to_model_error() {
+        let err = kchat_encoder::EncoderError::InferenceFailed("test".into());
+        let model_err: ModelError = err.into();
+        assert!(matches!(model_err, ModelError::Inference(_)));
+    }
+
+    #[test]
+    fn core_error_converts_to_model_error() {
+        let err = kchat_core::error::CoreError::Storage("test".into());
+        let model_err: ModelError = err.into();
+        assert!(matches!(model_err, ModelError::Custom(_)));
     }
 }

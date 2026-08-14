@@ -15,12 +15,21 @@ pub trait TextEmbedder: Send + Sync {
 }
 
 /// Stub embedder (returns zeros — used when ML is not available).
+///
+/// Returns 768-dim zero vectors to match `kchat-encoder::EMBEDDING_DIM`
+/// so that vectors stored with the stub are dimension-compatible with
+/// real kchat-encoder embeddings (though cosine similarity will still
+/// be 0.0 for zero vectors, so semantic search effectively returns no
+/// results — which is the intended degraded behaviour).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StubEmbedder;
 
+/// Embedding dimension — matches `kchat_encoder::EMBEDDING_DIM`.
+pub const EMBEDDING_DIM: usize = 768;
+
 impl TextEmbedder for StubEmbedder {
     fn embed(&self, _text: &str) -> Result<Vec<f32>, ModelError> {
-        Ok(vec![0.0; 384])
+        Ok(vec![0.0; EMBEDDING_DIM])
     }
 
     fn model_version(&self) -> &str {
@@ -98,5 +107,49 @@ pub mod kchat {
         fn model_version(&self) -> &str {
             "kchat-encoder-mock@v0"
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stub_embedder_returns_correct_dimension() {
+        // CRITICAL: StubEmbedder must return the same dimension as
+        // kchat-encoder (768), otherwise vectors stored with the stub
+        // would be incompatible with real embeddings.
+        let embedder = StubEmbedder;
+        let vec = embedder.embed("test").unwrap();
+        assert_eq!(vec.len(), EMBEDDING_DIM, "StubEmbedder dimension mismatch");
+        assert_eq!(vec.len(), 768, "EMBEDDING_DIM must be 768 to match kchat-encoder");
+        assert!(vec.iter().all(|&v| v == 0.0), "stub must return zeros");
+    }
+
+    #[test]
+    fn stub_embedder_model_version_is_stable() {
+        let embedder = StubEmbedder;
+        assert_eq!(embedder.model_version(), "stub@v0");
+    }
+
+    #[cfg(feature = "ml")]
+    #[test]
+    fn mock_kchat_embedder_matches_encoder_dim() {
+        let embedder = crate::models::embeddings::kchat::MockKchatEmbedder;
+        let vec = embedder.embed("test").unwrap();
+        assert_eq!(
+            vec.len(),
+            kchat_encoder::EMBEDDING_DIM,
+            "MockKchatEmbedder dimension must match kchat-encoder"
+        );
+    }
+
+    #[cfg(feature = "ml")]
+    #[test]
+    fn mock_kchat_embedder_is_deterministic() {
+        let embedder = crate::models::embeddings::kchat::MockKchatEmbedder;
+        let a = embedder.embed("hello").unwrap();
+        let b = embedder.embed("hello").unwrap();
+        assert_eq!(a, b, "MockKchatEmbedder must be deterministic for same input");
     }
 }
