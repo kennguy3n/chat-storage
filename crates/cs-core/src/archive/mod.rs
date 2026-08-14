@@ -10,4 +10,5 @@ pub mod prefetch;
 pub mod privacy;
 pub mod routing;
 pub mod segment_builder;
+pub mod types;
 pub mod upload;

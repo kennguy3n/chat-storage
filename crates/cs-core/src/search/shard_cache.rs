@@ -3,7 +3,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::formats::search_shard::{SearchShardFrame, ShardId};
+use crate::formats::search_shard::ShardId;
+use crate::search::SearchShardFrame;
 
 /// LRU cache for encrypted search shards.
 #[derive(Debug)]

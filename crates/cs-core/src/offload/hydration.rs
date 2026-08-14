@@ -57,12 +57,18 @@ impl HydrationQueue {
         let mut hydrated = 0;
 
         for req in &requests {
-            // Fetch the message from the gateway
+            // Look up the skeleton to get the conversation_id for fetching.
+            // If the skeleton is missing, the message was never ingested locally
+            // and we can't know which conversation to fetch from.
+            let skel = match db.get_message_skeleton(&req.message_id.to_string()) {
+                Ok(Some(s)) => s,
+                Ok(None) => continue,
+                Err(_) => continue,
+            };
+
+            // Fetch the message page from the gateway using the correct conversation_id
             let fetch_result = transport
-                .fetch_messages(
-                    &req.message_id.to_string(),
-                    Some(&req.message_id.to_string()),
-                )
+                .fetch_messages(&skel.conversation_id, Some(&req.message_id.to_string()))
                 .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
 
             if fetch_result.messages.is_empty() {
@@ -81,7 +87,10 @@ impl HydrationQueue {
                     reply_to: None,
                 };
 
-                MessagePersister::ingest_remote(db, &msg).map_err(crate::Error::Storage)?;
+                let persister = MessagePersister::new(db);
+                persister
+                    .persist_ingested_message(&msg)
+                    .map_err(crate::Error::from)?;
                 hydrated += 1;
             }
         }

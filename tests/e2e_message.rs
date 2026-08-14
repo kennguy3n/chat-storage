@@ -53,9 +53,15 @@ fn b2c_ingest_duplicate_idempotent() {
         media_descriptors: vec![],
         reply_to: None,
     };
-    let is_new = cs_core::message::processor::MessagePersister::ingest_remote(&db, &msg)
-        .expect("ingest failed");
-    assert!(!is_new, "duplicate should return false");
+    let result =
+        cs_core::message::processor::MessagePersister::new(&db).persist_ingested_message(&msg);
+    assert!(
+        matches!(
+            result,
+            Err(cs_core::message::ProcessorError::DuplicateMessage)
+        ),
+        "duplicate should return DuplicateMessage error"
+    );
 
     let count = db.count_messages("conv-dup").expect("count failed");
     assert_eq!(count, 1);
@@ -128,14 +134,14 @@ fn b2b_ingest_tenant_scoped() {
 
     // Verify conversation has tenant_id
     let conn = db.read().expect("read lock failed");
-    let tenant: Option<String> = conn
+    let tenant: String = conn
         .query_row(
-            "SELECT tenant_id FROM conversation WHERE id = ?1",
+            "SELECT tenant_id FROM conversation WHERE conversation_id = ?1",
             rusqlite::params!["conv-b2b"],
             |row| row.get(0),
         )
         .expect("query failed");
-    assert_eq!(tenant, Some("tenant-corp".to_string()));
+    assert_eq!(tenant, "tenant-corp");
 }
 
 #[test]

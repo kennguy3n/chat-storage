@@ -1,6 +1,6 @@
 //! Archive download — fetch segments and manifests from the gateway.
 
-use crate::formats::archive_segment::ArchiveSegmentFrame;
+use crate::archive::types::ArchiveSegmentFrame;
 use crate::transport::ChatStorageTransport;
 
 /// Download an archive segment from the gateway.

@@ -4,7 +4,9 @@ use std::sync::Mutex;
 
 use rusqlite::Connection;
 
+use super::state_machines::{ArchiveState, BodyState, MediaState};
 use super::{schema::SCHEMA_SQL, StorageError};
+use std::str::FromStr;
 
 /// The local encrypted store. Owns a write connection and a pool of
 /// read-only connections.
@@ -17,7 +19,7 @@ impl LocalStoreDb {
     /// Open (or create) the encrypted database at `path` with the
     /// given 32-byte key.
     pub fn open(path: &str, key: &[u8; 32]) -> Result<Self, StorageError> {
-        let conn = Connection::open(path).map_err(|e| StorageError::Database(e.to_string()))?;
+        let conn = Connection::open(path)?;
         Self::init_connection(&conn, key)?;
         Ok(Self {
             write_conn: Mutex::new(conn),
@@ -26,8 +28,7 @@ impl LocalStoreDb {
 
     /// Open an in-memory encrypted database (for tests).
     pub fn open_in_memory(key: &[u8; 32]) -> Result<Self, StorageError> {
-        let conn =
-            Connection::open_in_memory().map_err(|e| StorageError::Database(e.to_string()))?;
+        let conn = Connection::open_in_memory()?;
         Self::init_connection(&conn, key)?;
         Ok(Self {
             write_conn: Mutex::new(conn),
@@ -36,21 +37,14 @@ impl LocalStoreDb {
 
     fn init_connection(conn: &Connection, key: &[u8; 32]) -> Result<(), StorageError> {
         let key_hex = hex::encode(key);
-        conn.pragma_update(None, "key", &key_hex)
-            .map_err(|e| StorageError::Database(e.to_string()))?;
+        conn.pragma_update(None, "key", &key_hex)?;
         // Production pragmas for performance and concurrency
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| StorageError::Database(e.to_string()))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| StorageError::Database(e.to_string()))?;
-        conn.pragma_update(None, "cache_size", -65536) // 64MB cache
-            .map_err(|e| StorageError::Database(e.to_string()))?;
-        conn.pragma_update(None, "temp_store", "MEMORY")
-            .map_err(|e| StorageError::Database(e.to_string()))?;
-        conn.pragma_update(None, "busy_timeout", 5000) // 5s timeout
-            .map_err(|e| StorageError::Database(e.to_string()))?;
-        conn.execute_batch(SCHEMA_SQL)
-            .map_err(|e| StorageError::Migration(e.to_string()))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "cache_size", -65536)?; // 64MB cache
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?; // 5s timeout
+        conn.execute_batch(SCHEMA_SQL)?;
         Ok(())
     }
 
@@ -58,7 +52,7 @@ impl LocalStoreDb {
     pub fn write(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StorageError> {
         self.write_conn
             .lock()
-            .map_err(|_| StorageError::LockPoisoned)
+            .map_err(|_| StorageError::LockPoisoned("LocalStoreDb"))
     }
 
     /// Get a lock for read-only operations.
@@ -67,27 +61,29 @@ impl LocalStoreDb {
     pub fn read(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StorageError> {
         self.write_conn
             .lock()
-            .map_err(|_| StorageError::LockPoisoned)
+            .map_err(|_| StorageError::LockPoisoned("LocalStoreDb"))
     }
 
     /// Insert a conversation.
     pub fn insert_conversation(&self, conv: &super::Conversation) -> Result<(), StorageError> {
         let conn = self.write()?;
         conn.execute(
-            "INSERT OR REPLACE INTO conversation (id, conversation_type, scope, tenant_id, community_id, domain_id, name_encrypted, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR REPLACE INTO conversation (conversation_id, title_cipher, pinned, muted, last_message_id, last_activity_ms, conversation_type, scope, tenant_id, community_id, domain_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
-                conv.id,
+                conv.conversation_id,
+                conv.title_cipher,
+                conv.pinned as i32,
+                conv.muted as i32,
+                conv.last_message_id,
+                conv.last_activity_ms,
                 conv.conversation_type,
                 conv.scope,
                 conv.tenant_id,
                 conv.community_id,
                 conv.domain_id,
-                conv.name_encrypted,
-                conv.created_at_ms,
             ],
-        )
-        .map_err(|e| StorageError::Database(e.to_string()))?;
+        )?;
         Ok(())
     }
 
@@ -105,16 +101,15 @@ impl LocalStoreDb {
                 skeleton.created_at_ms,
                 skeleton.received_at_ms,
                 skeleton.kind.as_str(),
-                skeleton.body_state,
-                skeleton.media_state,
-                skeleton.archive_state,
-                skeleton.backup_state,
+                skeleton.body_state.to_string(),
+                skeleton.media_state.map(|s| s.to_string()),
+                skeleton.archive_state.to_string(),
+                skeleton.backup_state.to_string(),
                 skeleton.reply_to,
                 skeleton.edited_at_ms,
                 skeleton.deleted_at_ms,
             ],
-        )
-        .map_err(|e| StorageError::Database(e.to_string()))?;
+        )?;
         Ok(())
     }
 
@@ -123,10 +118,14 @@ impl LocalStoreDb {
         let conn = self.write()?;
         conn.execute(
             "INSERT OR REPLACE INTO message_body (message_id, text_content, detected_language, rich_meta)
-             VALUES (?1, ?2, ?3, NULL)",
-            rusqlite::params![body.message_id, body.text_content, body.detected_language],
-        )
-        .map_err(|e| StorageError::Database(e.to_string()))?;
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                body.message_id,
+                body.text_content,
+                body.detected_language,
+                body.rich_meta,
+            ],
+        )?;
         Ok(())
     }
 
@@ -144,8 +143,7 @@ impl LocalStoreDb {
             "INSERT INTO search_fts (message_id, conversation_id, sender_id, created_at_ms, text_content)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![message_id, conversation_id, sender_id, created_at_ms, text_content],
-        )
-        .map_err(|e| StorageError::Database(e.to_string()))?;
+        )?;
         Ok(())
     }
 
@@ -158,41 +156,35 @@ impl LocalStoreDb {
     ) -> Result<Vec<super::TimelineRow>, StorageError> {
         let conn = self.read()?;
         let sql = if before_ms.is_some() {
-            "SELECT message_id, conversation_id, sender_id, created_at_ms, kind, body_state, media_state, reply_to
+            "SELECT message_id, conversation_id, sender_id, created_at_ms, kind, body_state, reply_to, edited_at_ms, deleted_at_ms
              FROM message_skeleton
              WHERE conversation_id = ?1 AND created_at_ms < ?2 AND deleted_at_ms IS NULL
              ORDER BY created_at_ms DESC LIMIT ?3"
         } else {
-            "SELECT message_id, conversation_id, sender_id, created_at_ms, kind, body_state, media_state, reply_to
+            "SELECT message_id, conversation_id, sender_id, created_at_ms, kind, body_state, reply_to, edited_at_ms, deleted_at_ms
              FROM message_skeleton
              WHERE conversation_id = ?1 AND deleted_at_ms IS NULL
              ORDER BY created_at_ms DESC LIMIT ?2"
         };
 
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut stmt = conn.prepare(sql)?;
 
         let mut result = Vec::new();
         if let Some(before) = before_ms {
-            let rows = stmt
-                .query_map(
-                    rusqlite::params![conversation_id, before, limit as i64],
-                    map_timeline_row,
-                )
-                .map_err(|e| StorageError::Database(e.to_string()))?;
+            let rows = stmt.query_map(
+                rusqlite::params![conversation_id, before, limit as i64],
+                map_timeline_row,
+            )?;
             for row in rows {
-                result.push(row.map_err(|e| StorageError::Database(e.to_string()))?);
+                result.push(row?);
             }
         } else {
-            let rows = stmt
-                .query_map(
-                    rusqlite::params![conversation_id, limit as i64],
-                    map_timeline_row,
-                )
-                .map_err(|e| StorageError::Database(e.to_string()))?;
+            let rows = stmt.query_map(
+                rusqlite::params![conversation_id, limit as i64],
+                map_timeline_row,
+            )?;
             for row in rows {
-                result.push(row.map_err(|e| StorageError::Database(e.to_string()))?);
+                result.push(row?);
             }
         }
         Ok(result)
@@ -201,15 +193,16 @@ impl LocalStoreDb {
     /// Fetch a message body by message ID.
     pub fn fetch_body(&self, message_id: &str) -> Result<Option<super::MessageBody>, StorageError> {
         let conn = self.read()?;
-        let mut stmt = conn
-            .prepare("SELECT message_id, text_content, detected_language FROM message_body WHERE message_id = ?1")
-            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT message_id, text_content, detected_language, rich_meta FROM message_body WHERE message_id = ?1",
+        )?;
         let result = stmt
             .query_row(rusqlite::params![message_id], |row| {
                 Ok(super::MessageBody {
                     message_id: row.get(0)?,
                     text_content: row.get(1)?,
                     detected_language: row.get(2)?,
+                    rich_meta: row.get(3)?,
                 })
             })
             .ok();
@@ -222,8 +215,7 @@ impl LocalStoreDb {
         conn.execute(
             "UPDATE message_skeleton SET body_state = ?2 WHERE message_id = ?1",
             rusqlite::params![message_id, state],
-        )
-        .map_err(|e| StorageError::Database(e.to_string()))?;
+        )?;
         Ok(())
     }
 
@@ -238,27 +230,23 @@ impl LocalStoreDb {
             return Ok(Vec::new());
         }
         let conn = self.read()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT message_id, conversation_id, sender_id, created_at_ms, rank
-                 FROM search_fts WHERE search_fts MATCH ?1 ORDER BY rank LIMIT ?2",
-            )
-            .map_err(|e| StorageError::Database(e.to_string()))?;
-        let rows = stmt
-            .query_map(rusqlite::params![query, limit as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, f64>(4)?,
-                ))
-            })
-            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT message_id, conversation_id, sender_id, created_at_ms, rank
+             FROM search_fts WHERE search_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![query, limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, f64>(4)?,
+            ))
+        })?;
 
         let mut result = Vec::new();
         for row in rows {
-            result.push(row.map_err(|e| StorageError::Database(e.to_string()))?);
+            result.push(row?);
         }
         Ok(result)
     }
@@ -275,31 +263,27 @@ impl LocalStoreDb {
             return Ok(Vec::new());
         }
         let conn = self.read()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT message_id, conversation_id, sender_id, created_at_ms, rank
-                 FROM search_fts WHERE search_fts MATCH ?1 AND conversation_id = ?2
-                 ORDER BY rank LIMIT ?3",
-            )
-            .map_err(|e| StorageError::Database(e.to_string()))?;
-        let rows = stmt
-            .query_map(
-                rusqlite::params![query, conversation_id, limit as i64],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, f64>(4)?,
-                    ))
-                },
-            )
-            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT message_id, conversation_id, sender_id, created_at_ms, rank
+             FROM search_fts WHERE search_fts MATCH ?1 AND conversation_id = ?2
+             ORDER BY rank LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![query, conversation_id, limit as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, f64>(4)?,
+                ))
+            },
+        )?;
 
         let mut result = Vec::new();
         for row in rows {
-            result.push(row.map_err(|e| StorageError::Database(e.to_string()))?);
+            result.push(row?);
         }
         Ok(result)
     }
@@ -309,25 +293,22 @@ impl LocalStoreDb {
         let conn = self.write()?;
         conn.execute(
             "INSERT OR REPLACE INTO media_asset
-             (asset_id, message_id, mime_type, bytes_total, bytes_local, media_state, wrapped_k_asset, chunk_count, merkle_root, node_id, version_id, storage_sink, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             (asset_id, message_id, mime_type, bytes_total, bytes_local, media_state, wrapped_k_asset, chunk_count, merkle_root, blob_id, storage_sink)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 asset.asset_id,
                 asset.message_id,
                 asset.mime_type,
                 asset.bytes_total,
                 asset.bytes_local,
-                asset.media_state,
-                vec![0u8; 0], // wrapped_k_asset placeholder
+                asset.media_state.to_string(),
+                asset.wrapped_k_asset,
                 asset.chunk_count,
                 asset.merkle_root,
-                asset.node_id,
-                asset.version_id,
+                asset.blob_id,
                 asset.storage_sink,
-                asset.created_at_ms,
             ],
-        )
-        .map_err(|e| StorageError::Database(e.to_string()))?;
+        )?;
         Ok(())
     }
 
@@ -339,23 +320,25 @@ impl LocalStoreDb {
         let conn = self.read()?;
         let result = conn
             .query_row(
-                "SELECT asset_id, message_id, mime_type, bytes_total, bytes_local, media_state, chunk_count, merkle_root, node_id, version_id, storage_sink, created_at_ms
+                "SELECT asset_id, message_id, mime_type, bytes_total, bytes_local, media_state, wrapped_k_asset, chunk_count, merkle_root, blob_id, storage_sink
                  FROM media_asset WHERE asset_id = ?1",
                 rusqlite::params![asset_id],
                 |row| {
+                    let media_state_str: String = row.get(5)?;
+                    let media_state = MediaState::from_str(&media_state_str)
+                        .unwrap_or(MediaState::ThumbnailOnly);
                     Ok(super::MediaAsset {
                         asset_id: row.get(0)?,
                         message_id: row.get(1)?,
                         mime_type: row.get(2)?,
                         bytes_total: row.get(3)?,
                         bytes_local: row.get(4)?,
-                        media_state: row.get(5)?,
-                        chunk_count: row.get(6)?,
-                        merkle_root: row.get(7)?,
-                        node_id: row.get(8)?,
-                        version_id: row.get(9)?,
+                        media_state,
+                        wrapped_k_asset: row.get(6)?,
+                        chunk_count: row.get::<_, i64>(7)? as i32,
+                        merkle_root: row.get(8)?,
+                        blob_id: row.get(9)?,
                         storage_sink: row.get(10)?,
-                        created_at_ms: row.get(11)?,
                     })
                 },
             )
@@ -369,8 +352,7 @@ impl LocalStoreDb {
         conn.execute(
             "UPDATE media_asset SET media_state = ?2 WHERE asset_id = ?1",
             rusqlite::params![asset_id, state],
-        )
-        .map_err(|e| StorageError::Database(e.to_string()))?;
+        )?;
         Ok(())
     }
 
@@ -385,8 +367,7 @@ impl LocalStoreDb {
         conn.execute(
             "INSERT OR IGNORE INTO search_fuzzy (token, script, message_id) VALUES (?1, ?2, ?3)",
             rusqlite::params![token, script, message_id],
-        )
-        .map_err(|e| StorageError::Database(e.to_string()))?;
+        )?;
         Ok(())
     }
 
@@ -404,6 +385,10 @@ impl LocalStoreDb {
                  FROM message_skeleton WHERE message_id = ?1",
                 rusqlite::params![message_id],
                 |row| {
+                    let body_state_str: String = row.get(6)?;
+                    let media_state_str: Option<String> = row.get(7)?;
+                    let archive_state_str: String = row.get(8)?;
+                    let backup_state_str: String = row.get(9)?;
                     Ok(super::MessageSkeleton {
                         message_id: row.get(0)?,
                         conversation_id: row.get(1)?,
@@ -411,10 +396,17 @@ impl LocalStoreDb {
                         created_at_ms: row.get(3)?,
                         received_at_ms: row.get(4)?,
                         kind: super::MessageKind::parse(&row.get::<_, String>(5)?),
-                        body_state: row.get(6)?,
-                        media_state: row.get(7)?,
-                        archive_state: row.get(8)?,
-                        backup_state: row.get(9)?,
+                        body_state: BodyState::from_str(&body_state_str)
+                            .unwrap_or(BodyState::Unavailable),
+                        media_state: media_state_str
+                            .as_deref()
+                            .and_then(|s| MediaState::from_str(s).ok()),
+                        archive_state: ArchiveState::from_str(&archive_state_str)
+                            .unwrap_or(ArchiveState::NotArchived),
+                        backup_state: super::state_machines::BackupState::from_str(
+                            &backup_state_str,
+                        )
+                        .unwrap_or(super::state_machines::BackupState::NotBackedUp),
                         reply_to: row.get(10)?,
                         edited_at_ms: row.get(11)?,
                         deleted_at_ms: row.get(12)?,
@@ -431,26 +423,22 @@ impl LocalStoreDb {
         limit: usize,
     ) -> Result<Vec<(String, i64, i64)>, StorageError> {
         let conn = self.read()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT asset_id, bytes_local, created_at_ms
-                 FROM media_asset
-                 WHERE media_state = 'original_local' AND bytes_local > 0
-                 ORDER BY bytes_local DESC LIMIT ?1",
-            )
-            .map_err(|e| StorageError::Database(e.to_string()))?;
-        let rows = stmt
-            .query_map(rusqlite::params![limit as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT asset_id, bytes_local, bytes_total
+             FROM media_asset
+             WHERE media_state = 'original_local' AND bytes_local > 0
+             ORDER BY bytes_local DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
         let mut result = Vec::new();
         for row in rows {
-            result.push(row.map_err(|e| StorageError::Database(e.to_string()))?);
+            result.push(row?);
         }
         Ok(result)
     }
@@ -461,27 +449,23 @@ impl LocalStoreDb {
         limit: usize,
     ) -> Result<Vec<(String, i64, i64)>, StorageError> {
         let conn = self.read()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT mb.message_id, length(mb.text_content), ms.created_at_ms
-                 FROM message_body mb
-                 JOIN message_skeleton ms ON mb.message_id = ms.message_id
-                 WHERE ms.archive_state = 'archived' AND ms.deleted_at_ms IS NULL
-                 ORDER BY ms.created_at_ms ASC LIMIT ?1",
-            )
-            .map_err(|e| StorageError::Database(e.to_string()))?;
-        let rows = stmt
-            .query_map(rusqlite::params![limit as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT mb.message_id, length(mb.text_content), ms.created_at_ms
+             FROM message_body mb
+             JOIN message_skeleton ms ON mb.message_id = ms.message_id
+             WHERE ms.archive_state = 'archive_verified' AND ms.deleted_at_ms IS NULL
+             ORDER BY ms.created_at_ms ASC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
         let mut result = Vec::new();
         for row in rows {
-            result.push(row.map_err(|e| StorageError::Database(e.to_string()))?);
+            result.push(row?);
         }
         Ok(result)
     }
@@ -489,33 +473,400 @@ impl LocalStoreDb {
     /// Count messages in a conversation.
     pub fn count_messages(&self, conversation_id: &str) -> Result<i64, StorageError> {
         let conn = self.read()?;
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM message_skeleton WHERE conversation_id = ?1 AND deleted_at_ms IS NULL",
-                rusqlite::params![conversation_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM message_skeleton WHERE conversation_id = ?1 AND deleted_at_ms IS NULL",
+            rusqlite::params![conversation_id],
+            |row| row.get(0),
+        )?;
         Ok(count)
+    }
+
+    /// Insert a backup event journal entry.
+    pub fn insert_backup_event(
+        &self,
+        entry: &super::BackupEventJournalEntry,
+    ) -> Result<(), StorageError> {
+        let conn = self.write()?;
+        conn.execute(
+            "INSERT INTO backup_event_journal (event_type, conversation_id, message_id, payload, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                entry.event_type,
+                entry.conversation_id,
+                entry.message_id,
+                entry.payload,
+                entry.created_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Update a conversation's last_message_id and last_activity_ms.
+    pub fn update_conversation_last_message(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        activity_ms: i64,
+    ) -> Result<(), StorageError> {
+        let conn = self.write()?;
+        conn.execute(
+            "UPDATE conversation SET last_message_id = ?2, last_activity_ms = ?3
+             WHERE conversation_id = ?1",
+            rusqlite::params![conversation_id, message_id, activity_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Alias for `fetch_skeleton` matching the search repo API name.
+    pub fn get_message_skeleton(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<super::MessageSkeleton>, StorageError> {
+        self.fetch_skeleton(message_id)
+    }
+
+    /// Update the text content of a message body.
+    pub fn update_message_body_text(
+        &self,
+        message_id: &str,
+        new_text: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.write()?;
+        conn.execute(
+            "UPDATE message_body SET text_content = ?2 WHERE message_id = ?1",
+            rusqlite::params![message_id, new_text],
+        )?;
+        Ok(())
+    }
+
+    /// Set the `edited_at_ms` timestamp on a skeleton row.
+    pub fn update_skeleton_edited(
+        &self,
+        message_id: &str,
+        edited_at_ms: i64,
+    ) -> Result<(), StorageError> {
+        let conn = self.write()?;
+        conn.execute(
+            "UPDATE message_skeleton SET edited_at_ms = ?2 WHERE message_id = ?1",
+            rusqlite::params![message_id, edited_at_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a row from the FTS5 index.
+    pub fn delete_fts_row(&self, message_id: &str) -> Result<(), StorageError> {
+        let conn = self.write()?;
+        conn.execute(
+            "DELETE FROM search_fts WHERE message_id = ?1",
+            rusqlite::params![message_id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete fuzzy index rows for a message.
+    pub fn delete_fuzzy_rows(&self, message_id: &str) -> Result<(), StorageError> {
+        let conn = self.write()?;
+        conn.execute(
+            "DELETE FROM search_fuzzy WHERE message_id = ?1",
+            rusqlite::params![message_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a skeleton as deleted (set `deleted_at_ms` and update `body_state`).
+    pub fn update_skeleton_deleted(
+        &self,
+        message_id: &str,
+        deleted_at_ms: i64,
+        new_state: BodyState,
+    ) -> Result<(), StorageError> {
+        let conn = self.write()?;
+        conn.execute(
+            "UPDATE message_skeleton SET deleted_at_ms = ?2, body_state = ?3
+             WHERE message_id = ?1",
+            rusqlite::params![message_id, deleted_at_ms, new_state.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a message body row.
+    pub fn delete_message_body(&self, message_id: &str) -> Result<(), StorageError> {
+        let conn = self.write()?;
+        conn.execute(
+            "DELETE FROM message_body WHERE message_id = ?1",
+            rusqlite::params![message_id],
+        )?;
+        Ok(())
+    }
+
+    /// List all media assets attached to a message.
+    pub fn list_media_assets_by_message(
+        &self,
+        message_id: &str,
+    ) -> Result<Vec<super::MediaAsset>, StorageError> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT asset_id, message_id, mime_type, bytes_total, bytes_local, media_state,
+                    wrapped_k_asset, chunk_count, merkle_root, blob_id, storage_sink
+             FROM media_asset WHERE message_id = ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![message_id], |row| {
+            let media_state_str: String = row.get(5)?;
+            let media_state =
+                MediaState::from_str(&media_state_str).unwrap_or(MediaState::ThumbnailOnly);
+            Ok(super::MediaAsset {
+                asset_id: row.get(0)?,
+                message_id: row.get(1)?,
+                mime_type: row.get(2)?,
+                bytes_total: row.get(3)?,
+                bytes_local: row.get(4)?,
+                media_state,
+                wrapped_k_asset: row.get(6)?,
+                chunk_count: row.get::<_, i64>(7)? as i32,
+                merkle_root: row.get(8)?,
+                blob_id: row.get(9)?,
+                storage_sink: row.get(10)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
     }
 
     /// Get the current database size (approximate, from page_count * page_size).
     pub fn db_size_bytes(&self) -> Result<u64, StorageError> {
         let conn = self.read()?;
-        let page_count: i64 = conn
-            .query_row("PRAGMA page_count", [], |row| row.get(0))
-            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
         // SQLCipher may return text for page_size; handle both types
-        let page_size: i64 = conn
-            .query_row("PRAGMA page_size", [], |row| match row
+        let page_size: i64 =
+            conn.query_row("PRAGMA page_size", [], |row| match row
                 .get::<_, rusqlite::types::Value>(0)?
             {
                 rusqlite::types::Value::Integer(i) => Ok(i),
                 rusqlite::types::Value::Text(s) => Ok(s.parse::<i64>().unwrap_or(4096)),
                 _ => Ok(4096),
-            })
-            .map_err(|e| StorageError::Database(e.to_string()))?;
+            })?;
         Ok((page_count * page_size) as u64)
+    }
+
+    /// List all conversations (for backup serialization).
+    pub fn list_all_conversations(&self) -> Result<Vec<super::Conversation>, StorageError> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT conversation_id, title_cipher, pinned, muted, last_message_id,
+                    last_activity_ms, conversation_type, scope, tenant_id, community_id, domain_id
+             FROM conversation",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(super::Conversation {
+                conversation_id: row.get(0)?,
+                title_cipher: row.get(1)?,
+                pinned: row.get(2)?,
+                muted: row.get(3)?,
+                last_message_id: row.get(4)?,
+                last_activity_ms: row.get(5)?,
+                conversation_type: row.get(6)?,
+                scope: row.get(7)?,
+                tenant_id: row.get(8)?,
+                community_id: row.get(9)?,
+                domain_id: row.get(10)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// List all message skeletons (for backup serialization).
+    pub fn list_all_skeletons(&self) -> Result<Vec<super::MessageSkeleton>, StorageError> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT message_id, conversation_id, sender_id, created_at_ms, received_at_ms,
+                    kind, body_state, media_state, archive_state, backup_state,
+                    reply_to, edited_at_ms, deleted_at_ms
+             FROM message_skeleton",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let kind_str: String = row.get(5)?;
+            let body_state_str: String = row.get(6)?;
+            let media_state_str: Option<String> = row.get(7)?;
+            let archive_state_str: String = row.get(8)?;
+            let backup_state_str: String = row.get(9)?;
+            Ok(super::MessageSkeleton {
+                message_id: row.get(0)?,
+                conversation_id: row.get(1)?,
+                sender_id: row.get(2)?,
+                created_at_ms: row.get(3)?,
+                received_at_ms: row.get(4)?,
+                kind: super::MessageKind::parse(&kind_str),
+                body_state: BodyState::from_str(&body_state_str).unwrap_or(BodyState::Unavailable),
+                media_state: media_state_str
+                    .as_deref()
+                    .and_then(|s| MediaState::from_str(s).ok()),
+                archive_state: ArchiveState::from_str(&archive_state_str)
+                    .unwrap_or(ArchiveState::NotArchived),
+                backup_state: super::state_machines::BackupState::from_str(&backup_state_str)
+                    .unwrap_or(super::state_machines::BackupState::NotBackedUp),
+                reply_to: row.get(10)?,
+                edited_at_ms: row.get(11)?,
+                deleted_at_ms: row.get(12)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// List only skeletons that haven't been backed up yet (incremental backup).
+    pub fn list_skeletons_for_backup(&self) -> Result<Vec<super::MessageSkeleton>, StorageError> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT message_id, conversation_id, sender_id, created_at_ms, received_at_ms,
+                    kind, body_state, media_state, archive_state, backup_state,
+                    reply_to, edited_at_ms, deleted_at_ms
+             FROM message_skeleton
+             WHERE backup_state = 'not_backed_up'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let kind_str: String = row.get(5)?;
+            let body_state_str: String = row.get(6)?;
+            let media_state_str: Option<String> = row.get(7)?;
+            let archive_state_str: String = row.get(8)?;
+            let backup_state_str: String = row.get(9)?;
+            Ok(super::MessageSkeleton {
+                message_id: row.get(0)?,
+                conversation_id: row.get(1)?,
+                sender_id: row.get(2)?,
+                created_at_ms: row.get(3)?,
+                received_at_ms: row.get(4)?,
+                kind: super::MessageKind::parse(&kind_str),
+                body_state: BodyState::from_str(&body_state_str).unwrap_or(BodyState::Unavailable),
+                media_state: media_state_str
+                    .as_deref()
+                    .and_then(|s| MediaState::from_str(s).ok()),
+                archive_state: ArchiveState::from_str(&archive_state_str)
+                    .unwrap_or(ArchiveState::NotArchived),
+                backup_state: super::state_machines::BackupState::from_str(&backup_state_str)
+                    .unwrap_or(super::state_machines::BackupState::NotBackedUp),
+                reply_to: row.get(10)?,
+                edited_at_ms: row.get(11)?,
+                deleted_at_ms: row.get(12)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// List all message bodies (for backup serialization).
+    pub fn list_all_bodies(&self) -> Result<Vec<super::MessageBody>, StorageError> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT message_id, text_content, detected_language, rich_meta FROM message_body",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(super::MessageBody {
+                message_id: row.get(0)?,
+                text_content: row.get(1)?,
+                detected_language: row.get(2)?,
+                rich_meta: row.get(3)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Mark a skeleton as backed up.
+    pub fn mark_skeleton_backed_up(&self, message_id: &str) -> Result<(), StorageError> {
+        let conn = self.write()?;
+        conn.execute(
+            "UPDATE message_skeleton SET backup_state = 'backup_manifest_committed' WHERE message_id = ?1",
+            rusqlite::params![message_id],
+        )?;
+        Ok(())
+    }
+
+    /// Batch-mark multiple skeletons as backed up in a single transaction.
+    /// More efficient than calling `mark_skeleton_backed_up` N times.
+    pub fn batch_mark_skeletons_backed_up(&self, message_ids: &[&str]) -> Result<(), StorageError> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.write()?;
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE message_skeleton SET backup_state = 'backup_manifest_committed' WHERE message_id = ?1",
+            )?;
+            for id in message_ids {
+                stmt.execute(rusqlite::params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Re-index a message into FTS5 and fuzzy search indexes.
+    /// Used by the restore pipeline to rebuild search indexes.
+    pub fn reindex_message(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sender_id: &str,
+        created_at_ms: i64,
+        text: &str,
+    ) -> Result<(), StorageError> {
+        // Insert FTS5 row
+        self.index_fts(message_id, conversation_id, sender_id, created_at_ms, text)?;
+
+        // Insert fuzzy tokens
+        let tokens = crate::search::tokenizer::tokenize(text);
+        for (token, script) in &tokens {
+            let grams = match script {
+                crate::search::tokenizer::Script::Hani
+                | crate::search::tokenizer::Script::Hira
+                | crate::search::tokenizer::Script::Kana
+                | crate::search::tokenizer::Script::Hang => {
+                    crate::search::tokenizer::bigrams(token)
+                }
+                _ => crate::search::tokenizer::trigrams(token),
+            };
+            for gram in &grams {
+                self.index_fuzzy(gram, script.code(), message_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Clear all message-related data (for restore pre-clean).
+    ///
+    /// Deletes rows from search_fts, search_fuzzy, message_body, message_skeleton,
+    /// media_asset, conversation, backup_event_journal, and outbox tables.
+    /// This prevents silent merges when restoring into a non-empty database.
+    pub fn clear_all_message_data(&self) -> Result<(), StorageError> {
+        let conn = self.write()?;
+        conn.execute_batch(
+            "DELETE FROM search_fts;
+             DELETE FROM search_fuzzy;
+             DELETE FROM message_body;
+             DELETE FROM media_asset;
+             DELETE FROM message_skeleton;
+             DELETE FROM conversation;
+             DELETE FROM backup_event_journal;
+             DELETE FROM outbox;",
+        )?;
+        Ok(())
     }
 }
 
@@ -541,15 +892,19 @@ impl LocalStoreReaderPool {
 
 /// Helper function to map a rusqlite Row to a TimelineRow.
 fn map_timeline_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<super::TimelineRow> {
+    let kind_str: String = row.get(4)?;
+    let body_state_str: String = row.get(5)?;
     Ok(super::TimelineRow {
         message_id: row.get(0)?,
         conversation_id: row.get(1)?,
         sender_id: row.get(2)?,
         created_at_ms: row.get(3)?,
-        kind: row.get(4)?,
-        body_state: row.get(5)?,
-        media_state: row.get(6)?,
-        reply_to: row.get(7)?,
+        kind: super::MessageKind::parse(&kind_str),
+        body_state: BodyState::from_str(&body_state_str).unwrap_or(BodyState::Unavailable),
+        text_content: None,
+        reply_to: row.get(6)?,
+        edited_at_ms: row.get(7)?,
+        deleted_at_ms: row.get(8)?,
     })
 }
 
@@ -562,16 +917,7 @@ mod tests {
     fn test_open_and_schema() {
         let db = LocalStoreDb::open_in_memory(&[0x42u8; 32]).unwrap();
 
-        let conv = Conversation {
-            id: "conv-1".to_string(),
-            conversation_type: "direct".to_string(),
-            scope: "b2c".to_string(),
-            tenant_id: None,
-            community_id: None,
-            domain_id: None,
-            name_encrypted: None,
-            created_at_ms: 1_700_000_000_000,
-        };
+        let conv = Conversation::legacy("conv-1", None, false, false, None, 1_700_000_000_000);
         db.insert_conversation(&conv).unwrap();
 
         let skeleton = MessageSkeleton {
@@ -581,10 +927,10 @@ mod tests {
             created_at_ms: 1_700_000_000_000,
             received_at_ms: 1_700_000_001_000,
             kind: MessageKind::Text,
-            body_state: "local_plain_available".to_string(),
+            body_state: BodyState::LocalPlainAvailable,
             media_state: None,
-            archive_state: "not_archived".to_string(),
-            backup_state: "not_backed_up".to_string(),
+            archive_state: ArchiveState::NotArchived,
+            backup_state: super::super::state_machines::BackupState::NotBackedUp,
             reply_to: None,
             edited_at_ms: None,
             deleted_at_ms: None,
@@ -595,6 +941,7 @@ mod tests {
             message_id: "msg-1".to_string(),
             text_content: Some("Hello world".to_string()),
             detected_language: Some("en".to_string()),
+            rich_meta: None,
         };
         db.insert_body(&body).unwrap();
         db.index_fts(

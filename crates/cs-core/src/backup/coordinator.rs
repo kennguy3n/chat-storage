@@ -5,7 +5,8 @@ use crate::backup::manifest_builder::build_manifest as build_backup_manifest;
 use crate::backup::segment_builder::build_segment as build_backup_segment;
 use crate::backup::sinks::kdrive_sink;
 use crate::crypto::Key32;
-use crate::formats::backup_manifest::SegmentRef;
+use crate::formats::manifest::ManifestSegmentRef;
+use crate::formats::SegmentType;
 use crate::transport::ChatStorageTransport;
 
 /// The backup coordinator manages the backup lifecycle.
@@ -48,22 +49,23 @@ impl BackupCoordinator {
         });
 
         // Build manifest
-        let segment_ref = SegmentRef {
-            segment_id: uploaded_id.clone(),
-            storage_key: uploaded_id,
+        let segment_ref = ManifestSegmentRef {
+            segment_id: uuid::Uuid::parse_str(&uploaded_id)
+                .unwrap_or_else(|_| uuid::Uuid::now_v7()),
+            segment_type: SegmentType::Events,
+            ciphertext_sha256: plaintext_hash,
             size: ciphertext.len() as u64,
-            merkle_root: plaintext_hash,
         };
 
         let manifest = build_backup_manifest(
             self.current_generation,
             self.prev_manifest_hash,
             vec![segment_ref],
-            vec![], // no wrapped epoch keys for backup
+            vec![],
         )?;
 
         // Encode and upload manifest
-        let manifest_bytes = serde_json::to_vec(&manifest)
+        let manifest_bytes = crate::cbor::to_vec(&manifest)
             .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
         kdrive_sink::upload_manifest(transport, &manifest_bytes)?;
 

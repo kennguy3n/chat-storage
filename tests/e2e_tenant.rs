@@ -47,11 +47,13 @@ fn x_tenant_archive_isolation() {
 
     let transport_a = cs_core::transport::kdrive_bridge::KdriveTransport::new(
         gateway.base_url.clone(),
+        "test-token-tenant-a".to_string(),
         "tenant-a".to_string(),
         "user-a".to_string(),
     );
     let transport_b = cs_core::transport::kdrive_bridge::KdriveTransport::new(
         gateway.base_url.clone(),
+        "test-token-tenant-b".to_string(),
         "tenant-b".to_string(),
         "user-b".to_string(),
     );
@@ -79,11 +81,13 @@ fn x_tenant_search_shard_isolation() {
 
     let transport_a = cs_core::transport::kdrive_bridge::KdriveTransport::new(
         gateway.base_url.clone(),
+        "test-token-tenant-a".to_string(),
         "tenant-a".to_string(),
         "user-a".to_string(),
     );
     let transport_b = cs_core::transport::kdrive_bridge::KdriveTransport::new(
         gateway.base_url.clone(),
+        "test-token-tenant-b".to_string(),
         "tenant-b".to_string(),
         "user-b".to_string(),
     );
@@ -111,11 +115,13 @@ fn x_tenant_backup_manifest_isolation() {
 
     let transport_a = cs_core::transport::kdrive_bridge::KdriveTransport::new(
         gateway.base_url.clone(),
+        "test-token-tenant-a".to_string(),
         "tenant-a".to_string(),
         "user-a".to_string(),
     );
     let transport_b = cs_core::transport::kdrive_bridge::KdriveTransport::new(
         gateway.base_url.clone(),
+        "test-token-tenant-b".to_string(),
         "tenant-b".to_string(),
         "user-b".to_string(),
     );
@@ -143,11 +149,13 @@ fn x_tenant_cross_fetch_messages() {
 
     let transport_a = cs_core::transport::kdrive_bridge::KdriveTransport::new(
         gateway.base_url.clone(),
+        "test-token-tenant-a".to_string(),
         "tenant-a".to_string(),
         "user-a".to_string(),
     );
     let transport_b = cs_core::transport::kdrive_bridge::KdriveTransport::new(
         gateway.base_url.clone(),
+        "test-token-tenant-b".to_string(),
         "tenant-b".to_string(),
         "user-b".to_string(),
     );
@@ -193,14 +201,14 @@ fn b2b_tenant_scoped_conversation() {
 
     // Verify conversation has tenant_id set
     let conn = db.read().expect("read failed");
-    let tenant: Option<String> = conn
+    let tenant: String = conn
         .query_row(
-            "SELECT tenant_id FROM conversation WHERE id = ?1",
+            "SELECT tenant_id FROM conversation WHERE conversation_id = ?1",
             rusqlite::params!["conv-b2b-scope"],
             |row| row.get(0),
         )
         .expect("query failed");
-    assert_eq!(tenant, Some("tenant-corp".to_string()));
+    assert_eq!(tenant, "tenant-corp");
 }
 
 #[test]
@@ -222,15 +230,15 @@ fn b2c_personal_no_tenant() {
     // Verify conversation has no tenant_id
     {
         let conn = db.read().expect("read failed");
-        let tenant: Option<String> = conn
+        let tenant: String = conn
             .query_row(
-                "SELECT tenant_id FROM conversation WHERE id = ?1",
+                "SELECT tenant_id FROM conversation WHERE conversation_id = ?1",
                 rusqlite::params!["conv-b2c-personal"],
                 |row| row.get(0),
             )
             .expect("query failed");
         assert!(
-            tenant.is_none(),
+            tenant.is_empty(),
             "B2C personal conversation should have no tenant_id"
         );
     }

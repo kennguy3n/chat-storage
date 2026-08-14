@@ -42,6 +42,23 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 
+# Key wrapping (RFC 3394)
+aes-kw = { workspace = true }
+# Post-quantum signatures
+ml-dsa = { workspace = true }
+# Argon2id for key recovery
+argon2 = { workspace = true }
+# Regex for entity extraction
+regex = { workspace = true }
+# Image decoding for thumbnails
+image = { workspace = true }
+# Unicode normalization for tokenizer
+unicode-normalization = { workspace = true }
+# Binary serde helpers
+serde_bytes = { workspace = true }
+# CBOR encoding for wire formats (serde-compatible)
+ciborium = { workspace = true }
+
 # SQLCipher
 rusqlite = { workspace = true }
 

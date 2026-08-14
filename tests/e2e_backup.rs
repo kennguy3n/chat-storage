@@ -5,7 +5,8 @@ use cs_core::backup::coordinator::BackupCoordinator;
 use cs_core::backup::manifest_builder::{build_manifest, manifest_hash};
 use cs_core::backup::segment_builder::{build_segment, open_segment};
 use cs_core::crypto::key_bridge;
-use cs_core::formats::backup_manifest::{decode_payload, encode_payload, SegmentRef};
+use cs_core::formats::manifest::ManifestSegmentRef;
+use cs_core::formats::SegmentType;
 use cs_core::transport::ChatStorageTransport;
 
 #[test]
@@ -48,14 +49,14 @@ fn b2c_backup_segment_encrypted() {
     let backup_key = key_bridge::derive_backup_root(&[0x42u8; 32]);
     let plaintext = b"sensitive backup data with secrets";
 
-    let (ciphertext, nonce, hash) = build_segment(plaintext, &backup_key).expect("build failed");
+    let (frame, _nonce, hash) = build_segment(plaintext, &backup_key).expect("build failed");
 
-    // Ciphertext should not contain plaintext
-    assert!(!ciphertext.windows(plaintext.len()).any(|w| w == plaintext));
+    // Frame should not contain plaintext
+    assert!(!frame.windows(plaintext.len()).any(|w| w == plaintext));
     assert!(!hash.iter().all(|&b| b == 0));
 
     // Decrypt and verify
-    let recovered = open_segment(&ciphertext, &nonce, &backup_key).expect("open failed");
+    let recovered = open_segment(&frame, &backup_key).expect("open failed");
     assert_eq!(recovered.as_slice(), plaintext);
 }
 
@@ -74,22 +75,23 @@ fn b2c_backup_manifest_encode_decode_roundtrip() {
     let manifest = build_manifest(
         5,
         [0xaa; 32],
-        vec![SegmentRef {
-            segment_id: "seg-1".to_string(),
-            storage_key: "key-1".to_string(),
+        vec![ManifestSegmentRef {
+            segment_id: uuid::Uuid::now_v7(),
+            segment_type: SegmentType::Events,
+            ciphertext_sha256: [0xbb; 32],
             size: 1024,
-            merkle_root: [0xbb; 32],
         }],
         vec![],
     )
     .expect("build failed");
 
-    let encoded = encode_payload(&manifest).expect("encode failed");
-    let decoded = decode_payload(&encoded).expect("decode failed");
+    let encoded = cs_core::cbor::to_vec(&manifest).expect("encode failed");
+    let decoded: cs_core::formats::manifest::BackupManifest =
+        cs_core::cbor::from_slice(&encoded).expect("decode failed");
 
     assert_eq!(decoded.generation, 5);
     assert_eq!(decoded.segments.len(), 1);
-    assert_eq!(decoded.segments[0].segment_id, "seg-1");
+    assert_eq!(decoded.segments[0].size, 1024);
 }
 
 #[test]
@@ -99,11 +101,13 @@ fn b2b_backup_tenant_isolation() {
 
     let transport_a = cs_core::transport::kdrive_bridge::KdriveTransport::new(
         gateway.base_url.clone(),
+        "test-token-tenant-a".to_string(),
         "tenant-a".to_string(),
         "user-a".to_string(),
     );
     let transport_b = cs_core::transport::kdrive_bridge::KdriveTransport::new(
         gateway.base_url.clone(),
+        "test-token-tenant-b".to_string(),
         "tenant-b".to_string(),
         "user-b".to_string(),
     );

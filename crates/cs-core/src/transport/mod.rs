@@ -95,4 +95,14 @@ pub trait ChatStorageTransport: Send + Sync {
     /// Fetch backup manifests after a generation.
     fn fetch_backup_manifests(&self, after_generation: u64)
         -> Result<Vec<Vec<u8>>, TransportError>;
+
+    /// Upload an encrypted media blob to the gateway.
+    fn upload_media_blob(&self, blob_id: &str, ciphertext: &[u8])
+        -> Result<String, TransportError>;
+
+    /// Download an encrypted media blob from the gateway.
+    fn download_media_blob(&self, blob_id: &str) -> Result<Vec<u8>, TransportError>;
+
+    /// Download a backup segment from the gateway.
+    fn download_backup_segment(&self, segment_id: &str) -> Result<Vec<u8>, TransportError>;
 }

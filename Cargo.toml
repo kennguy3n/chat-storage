@@ -50,6 +50,26 @@ tokio = { version = "1", features = ["rt", "macros", "sync"] }
 # SQLCipher
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 
+# Key wrapping (RFC 3394)
+aes-kw = { version = "0.2", default-features = false }
+# Post-quantum signatures (ML-DSA-65 / FIPS 204)
+ml-dsa = { version = "0.0.4", features = ["rand_core"] }
+# Argon2id KDF for passphrase-based key recovery
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+# Regex for entity extraction
+regex = { version = "1", default-features = false, features = ["std", "unicode"] }
+# Image decoding for thumbnails
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Unicode normalization for tokenizer
+unicode-normalization = "0.1"
+# Binary serde helpers
+serde_bytes = "0.11"
+# CBOR encoding for wire formats (serde-compatible)
+ciborium = "0.2"
+
+# Benchmarking
+criterion = { version = "0.5", features = ["html_reports"] }
+
 # Optional ML deps (behind features)
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "tracing", "download-binaries", "copy-dylibs", "api-24", "tls-rustls"] }
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }

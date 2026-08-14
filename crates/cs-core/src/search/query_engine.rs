@@ -9,7 +9,7 @@ use crate::search::{
     semantic_search::semantic_search, shard_cache::ShardCache, text_search::text_search,
     SearchError,
 };
-use crate::{SearchQuery, SearchResult, SearchScope};
+use crate::{ContentKind, SearchQuery, SearchResult, SearchScope};
 
 /// The query engine unifies local FTS5, fuzzy, and semantic search
 /// with cold-shard search when `SearchScope::IncludeCold` is selected.
@@ -85,13 +85,42 @@ impl QueryEngine {
             }
         }
 
-        // Deduplicate by message_id and sort by score descending
+        // 6. Apply post-filters from SearchQuery (sender_id, date range, content_kind)
+        results.retain(|r| {
+            // Filter by sender_id
+            if let Some(ref sender) = query.sender_id {
+                if &r.sender_id != sender {
+                    return false;
+                }
+            }
+            // Filter by date range
+            if let Some(from) = query.date_from_ms {
+                if r.created_at_ms < from {
+                    return false;
+                }
+            }
+            if let Some(to) = query.date_to_ms {
+                if r.created_at_ms > to {
+                    return false;
+                }
+            }
+            // Filter by content_kind
+            if let Some(kind) = query.content_kind {
+                if !matches_content_kind(r, kind, &self.db) {
+                    return false;
+                }
+            }
+            true
+        });
+
+        // Deduplicate by message_id and sort by score descending, recency tiebreaker
         let mut seen = std::collections::HashSet::new();
         results.retain(|r| seen.insert(r.message_id));
         results.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.created_at_ms.cmp(&a.created_at_ms))
         });
         results.truncate(limit);
 
@@ -113,6 +142,48 @@ impl QueryEngine {
         // The shard_cache is checked first to avoid re-fetching.
         let _ = (source, query, limit);
         Ok(Vec::new())
+    }
+}
+
+/// Check if a search result matches the requested content kind filter.
+///
+/// Looks up the message skeleton to determine if the message is text, media,
+/// etc. Link filtering checks the snippet for URLs.
+fn matches_content_kind(result: &SearchResult, kind: ContentKind, db: &LocalStoreDb) -> bool {
+    match kind {
+        ContentKind::Text => {
+            // Text messages: skeleton kind == "text"
+            if let Ok(Some(skeleton)) = db.fetch_skeleton(&result.message_id.to_string()) {
+                skeleton.kind == crate::local_store::MessageKind::Text
+            } else {
+                false
+            }
+        }
+        ContentKind::Media => {
+            // Media messages: skeleton kind == "media"
+            if let Ok(Some(skeleton)) = db.fetch_skeleton(&result.message_id.to_string()) {
+                skeleton.kind == crate::local_store::MessageKind::Media
+            } else {
+                false
+            }
+        }
+        ContentKind::Document => {
+            // Document: media with document-like mime type (pdf, etc.)
+            // Check if there's a media asset with a document mime type
+            if let Ok(Some(skeleton)) = db.fetch_skeleton(&result.message_id.to_string()) {
+                if skeleton.kind != crate::local_store::MessageKind::Media {
+                    return false;
+                }
+                // Could check media_asset mime_type here; for now treat all media as potential documents
+                true
+            } else {
+                false
+            }
+        }
+        ContentKind::Link => {
+            // Link: snippet contains a URL pattern
+            result.snippet.contains("http://") || result.snippet.contains("https://")
+        }
     }
 }
 

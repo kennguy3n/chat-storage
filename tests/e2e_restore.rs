@@ -2,22 +2,22 @@
 
 use crate::helpers::*;
 use cs_core::backup::manifest_builder::{build_manifest, manifest_hash};
-use cs_core::formats::backup_manifest::{
-    decode_payload, encode_payload, BackupManifestPayload, SegmentRef,
-};
+use cs_core::formats::manifest::{BackupManifest, ManifestSegmentRef};
+use cs_core::formats::SegmentType;
 use cs_core::restore::manifest_verifier::verify_chain;
 use cs_core::restore::state_machine::RestoreState;
 
 #[test]
 fn b2c_restore_state_machine_transitions() {
     let states = [
-        RestoreState::NotStarted,
-        RestoreState::FetchingManifests,
-        RestoreState::FetchingSkeletons,
-        RestoreState::FetchingBodies,
-        RestoreState::FetchingMedia,
-        RestoreState::BuildingIndexes,
-        RestoreState::Complete,
+        RestoreState::IdentityRestored,
+        RestoreState::RootKeysUnwrapped,
+        RestoreState::ManifestVerified,
+        RestoreState::SkeletonRestored,
+        RestoreState::SearchRestored,
+        RestoreState::RecentMessagesRestored,
+        RestoreState::MediaLazyRestoreEnabled,
+        RestoreState::FullRestoreComplete,
     ];
 
     // Verify all states are distinct
@@ -65,25 +65,32 @@ fn b2c_restore_manifest_verification_tampered() {
 
 #[test]
 fn b2c_restore_manifest_decode_roundtrip() {
-    let manifest = BackupManifestPayload {
+    let manifest = BackupManifest {
+        magic: cs_core::formats::manifest::BACKUP_MANIFEST_MAGIC.to_string(),
+        version: cs_core::formats::manifest::MANIFEST_VERSION,
+        manifest_id: uuid::Uuid::now_v7(),
         generation: 42,
         previous_manifest_hash: [0xaa; 32],
-        segments: vec![SegmentRef {
-            segment_id: "seg-restore".to_string(),
-            storage_key: "key-restore".to_string(),
+        segments: vec![ManifestSegmentRef {
+            segment_id: uuid::Uuid::now_v7(),
+            segment_type: SegmentType::Events,
+            ciphertext_sha256: [0xbb; 32],
             size: 2048,
-            merkle_root: [0xbb; 32],
         }],
-        wrapped_epoch_keys: vec![],
-        created_at_ms: 1_700_000_000_000,
+        search_index_shards: vec![],
+        media_references: vec![],
+        tombstones: vec![],
+        merkle_root: [0u8; 32],
+        manifest_signature: vec![],
+        pqc_signature: vec![],
     };
 
-    let encoded = encode_payload(&manifest).expect("encode failed");
-    let decoded = decode_payload(&encoded).expect("decode failed");
+    let encoded = cs_core::cbor::to_vec(&manifest).expect("encode failed");
+    let decoded: BackupManifest = cs_core::cbor::from_slice(&encoded).expect("decode failed");
 
     assert_eq!(decoded.generation, 42);
     assert_eq!(decoded.segments.len(), 1);
-    assert_eq!(decoded.segments[0].segment_id, "seg-restore");
+    assert_eq!(decoded.segments[0].size, 2048);
 }
 
 #[test]

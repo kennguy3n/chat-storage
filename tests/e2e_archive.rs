@@ -137,6 +137,7 @@ fn b2c_archive_single_batch() {
     let gateway = crate::harness::GatewayHarness::start().expect("gateway failed");
     let transport = cs_core::transport::kdrive_bridge::KdriveTransport::new(
         gateway.base_url.clone(),
+        "test-token-tenant-a".to_string(),
         "tenant-a".to_string(),
         "user-a".to_string(),
     );
@@ -159,11 +160,13 @@ fn b2b_archive_tenant_isolation() {
 
     let transport_a = cs_core::transport::kdrive_bridge::KdriveTransport::new(
         gateway.base_url.clone(),
+        "test-token-tenant-a".to_string(),
         "tenant-a".to_string(),
         "user-a".to_string(),
     );
     let transport_b = cs_core::transport::kdrive_bridge::KdriveTransport::new(
         gateway.base_url.clone(),
+        "test-token-tenant-b".to_string(),
         "tenant-b".to_string(),
         "user-b".to_string(),
     );

@@ -141,6 +141,7 @@ fn transport_kdrive_roundtrip() {
     let gateway = crate::harness::GatewayHarness::start().expect("gateway failed");
     let transport = cs_core::transport::kdrive_bridge::KdriveTransport::new(
         gateway.base_url.clone(),
+        "test-token".to_string(),
         "tenant-test".to_string(),
         "user-test".to_string(),
     );
@@ -167,6 +168,7 @@ fn transport_kdrive_404() {
     let gateway = crate::harness::GatewayHarness::start().expect("gateway failed");
     let transport = cs_core::transport::kdrive_bridge::KdriveTransport::new(
         gateway.base_url.clone(),
+        "test-token".to_string(),
         "tenant-test".to_string(),
         "user-test".to_string(),
     );

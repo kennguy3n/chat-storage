@@ -85,7 +85,10 @@ impl CoreImpl {
         reply_to: Option<Uuid>,
     ) -> Result<ClientMessageId, crate::Error> {
         let entry = MessageProcessor::create_outbox_entry(conversation_id, text, reply_to);
-        MessagePersister::persist_outbox_entry(&self.db, &entry).map_err(crate::Error::Storage)?;
+        let persister = MessagePersister::new(&self.db);
+        persister
+            .persist_outbox_entry(&entry)
+            .map_err(crate::Error::from)?;
         Ok(ClientMessageId(entry.client_message_id))
     }
 
@@ -121,13 +124,13 @@ impl CoreImpl {
 
             MessageProcessor::validate(&ingested)?;
 
-            let is_new = MessagePersister::ingest_remote(&self.db, &ingested)
-                .map_err(crate::Error::Storage)?;
-
-            if is_new {
-                result.new_count += 1;
-            } else {
-                result.duplicate_count += 1;
+            let persister = MessagePersister::new(&self.db);
+            match persister.persist_ingested_message(&ingested) {
+                Ok(()) => result.new_count += 1,
+                Err(crate::message::ProcessorError::DuplicateMessage) => {
+                    result.duplicate_count += 1;
+                }
+                Err(e) => return Err(crate::Error::from(e)),
             }
         }
 
@@ -206,15 +209,23 @@ impl CoreImpl {
     ) -> Result<BackupResult, crate::Error> {
         let backup_key = key_bridge::derive_backup_root(&self.wrapping_key);
 
-        // Collect data to backup — serialize message skeletons + bodies
-        // since the last backup generation. For now, we export the DB snapshot.
-        let data = b"chat-storage-backup-snapshot"; // placeholder
+        // Collect actual data from the local store — serialize conversations,
+        // message skeletons, and bodies into a CBOR backup snapshot.
+        let snapshot = crate::backup::snapshot::BackupSnapshot::from_db(&self.db)?;
+        let data = snapshot.to_cbor()?;
+
+        if data.is_empty() {
+            return Ok(BackupResult::default());
+        }
 
         let mut coordinator = self
             .backup_coordinator
             .lock()
             .map_err(|_| crate::Error::Storage("backup coordinator lock poisoned".into()))?;
-        let generation = coordinator.run_backup(data, &backup_key, self.transport.as_ref())?;
+        let generation = coordinator.run_backup(&data, &backup_key, self.transport.as_ref())?;
+
+        // Mark all backed-up skeletons as backed_up
+        snapshot.mark_backed_up(&self.db)?;
 
         Ok(BackupResult {
             segments_built: 1,
@@ -242,17 +253,16 @@ impl CoreImpl {
             match candidate.kind {
                 crate::offload::eviction::EvictionTier::MessageBodies => {
                     messages_offloaded += 1;
-                    let _ = self
-                        .db
-                        .update_body_state(&candidate.id, "remote_archive_only");
+                    self.db
+                        .update_body_state(&candidate.id, "remote_archive_only")?;
                 }
                 crate::offload::eviction::EvictionTier::MediaOriginals => {
                     media_offloaded += 1;
-                    let _ = self.db.update_media_state(&candidate.id, "evicted");
+                    self.db.update_media_state(&candidate.id, "evicted")?;
                 }
                 crate::offload::eviction::EvictionTier::MediaThumbnails => {
                     media_offloaded += 1;
-                    let _ = self.db.update_media_state(&candidate.id, "evicted");
+                    self.db.update_media_state(&candidate.id, "evicted")?;
                 }
                 _ => {}
             }
@@ -268,7 +278,12 @@ impl CoreImpl {
     /// Restore from a backup source.
     pub fn restore_from_backup(&self, source: BackupSource) -> Result<RestoreResult, crate::Error> {
         let mut pipeline = RestorePipeline::new();
-        pipeline.execute(&source, &self.wrapping_key, self.transport.as_ref())
+        pipeline.execute(
+            &source,
+            &self.wrapping_key,
+            self.transport.as_ref(),
+            &self.db,
+        )
     }
 
     /// Register a device for the current account.
@@ -277,11 +292,12 @@ impl CoreImpl {
     /// a device keypair and device certificate signed by the account root key.
     /// The `account_token` is used to look up or create the account authority.
     ///
-    /// In production, the account authority record and device private key
-    /// would be persisted in the encrypted `DriveKeyVault`. For now, we
-    /// generate the keypair and return the device ID.
+    /// The device private key is persisted in an encrypted `DriveKeyVault`.
+    /// The vault's master key is derived from the wrapping key via HKDF and
+    /// is **never** written to disk. Only the encrypted vault entries are
+    /// persisted; the master key is re-derived on each session.
     pub fn register_device(&self, account_token: &str) -> Result<DeviceRegistration, crate::Error> {
-        use kchat_drive_identity::{enroll_user, DeviceKeyPair};
+        use kchat_drive_identity::{enroll_user, DeviceKeyPair, DriveKeyVault};
         use kchat_drive_types::UserId;
         use std::str::FromStr;
 
@@ -292,16 +308,43 @@ impl CoreImpl {
 
         // Generate device keypair
         let device_id = kchat_drive_types::DeviceId::random();
-        let _device_keypair = DeviceKeyPair::generate(device_id.clone());
+        let device_keypair = DeviceKeyPair::generate(device_id.clone());
 
         // Enroll user (creates account authority + first device).
-        // In production, we'd check if the account already exists in the
-        // vault and call add_device instead of enroll_user.
         let _enrollment = enroll_user(user_id, Some(format!("device-{}", device_id)))
             .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
 
-        // In production: store device_keypair private key in DriveKeyVault
-        // and persist account authority record. For now, just return the result.
+        // Derive vault master key from wrapping key (never persisted to disk)
+        let vault_master_key = key_bridge::derive_local_db_key(&self.wrapping_key);
+
+        // Load existing vault entries from disk (if any), then add new key
+        let vault_path = self.config.data_dir.join("device_vault.bin");
+        let mut vault = DriveKeyVault::from_master_key(vault_master_key);
+
+        // Import existing entries if vault file exists
+        if vault_path.exists() {
+            if let Ok(vault_bytes) = std::fs::read(&vault_path) {
+                if let Ok(entries) = serde_json::from_slice::<
+                    Vec<kchat_drive_identity::VaultEntryExport>,
+                >(&vault_bytes)
+                {
+                    vault.import_data(&entries);
+                }
+            }
+        }
+
+        // Store the device private key in the vault
+        let device_key_id = format!("device:{}", hex::encode(device_id.as_bytes()));
+        vault
+            .store(&device_key_id, &device_keypair.private_key_bytes())
+            .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
+
+        // Persist only the encrypted vault entries (master key is never on disk)
+        let vault_bytes = serde_json::to_vec(&vault.export_data())
+            .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
+        std::fs::write(&vault_path, &vault_bytes)
+            .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
+
         let device_id_hex = hex::encode(device_id.as_bytes());
 
         Ok(DeviceRegistration {
@@ -311,62 +354,173 @@ impl CoreImpl {
     }
 
     /// Send a media message.
+    ///
+    /// Encrypts the media with a per-asset key derived from the media key
+    /// hierarchy (separate from archive keys), uploads the encrypted blob,
+    /// and persists the skeleton + body + media asset in the local store.
     pub fn send_media(
         &self,
         conversation_id: Uuid,
         local_file: &std::path::Path,
         caption: Option<&str>,
     ) -> Result<SendMediaResult, crate::Error> {
-        let plaintext =
+        use crate::local_store::state_machines::{
+            ArchiveState, BackupState, BodyState, MediaState,
+        };
+        use crate::local_store::{MessageKind, MessageSkeleton};
+
+        let mut plaintext =
             std::fs::read(local_file).map_err(|e| crate::Error::Storage(e.to_string().into()))?;
 
         let mime_type = mime_from_extension(local_file);
         let asset_id = uuid::Uuid::now_v7().to_string();
         let message_id = uuid::Uuid::now_v7().to_string();
+        let blob_id = uuid::Uuid::now_v7().to_string();
+        let now = now_ms();
 
         // Process media (compute chunk count, merkle root, etc.)
         let descriptor = crate::media::processor::process_media(
-            &asset_id, &mime_type, &plaintext, "", // node_id — will be set after upload
-            "", // version_id — will be set after upload
+            &asset_id, &mime_type, &plaintext, &blob_id, &blob_id, &blob_id,
         )?;
 
-        // Store media asset record in local DB
+        // Encrypt the media plaintext using a per-asset media key
+        // derived from K_media_root (separate from archive key hierarchy)
+        let media_root = key_bridge::derive_media_root(&self.wrapping_key);
+        let media_key = key_bridge::derive_media_blob(&media_root, asset_id.as_bytes());
+        let nonce = crate::crypto::aead::random_nonce_24();
+        let ciphertext = crate::crypto::seal(
+            &media_key,
+            &nonce,
+            &plaintext,
+            b"chat-storage/media-blob/v1",
+        )?;
+
+        // Zeroize plaintext after encryption
+        use zeroize::Zeroize;
+        plaintext.zeroize();
+
+        // Insert skeleton + body + media asset into DB *before* uploading.
+        // All three inserts are wrapped in a SAVEPOINT so that a failure in
+        // any one rolls back the others — no partial records left behind.
+        let skeleton = MessageSkeleton {
+            message_id: message_id.clone(),
+            conversation_id: conversation_id.to_string(),
+            sender_id: "local".to_string(),
+            created_at_ms: now,
+            received_at_ms: now,
+            kind: MessageKind::Media,
+            body_state: BodyState::LocalPlainAvailable,
+            media_state: Some(MediaState::RemoteOriginal),
+            archive_state: ArchiveState::NotArchived,
+            backup_state: BackupState::NotBackedUp,
+            reply_to: None,
+            edited_at_ms: None,
+            deleted_at_ms: None,
+        };
+
+        // Insert caption as body text (or empty body for media-only)
+        let body = crate::local_store::MessageBody {
+            message_id: message_id.clone(),
+            text_content: caption.map(|c| c.to_string()),
+            detected_language: None,
+            rich_meta: None,
+        };
+
+        // Insert media asset record
         let asset = crate::local_store::MediaAsset {
             asset_id: asset_id.clone(),
             message_id: message_id.clone(),
             mime_type: mime_type.clone(),
-            bytes_total: plaintext.len() as i64,
-            bytes_local: plaintext.len() as i64,
-            media_state: "original_local".to_string(),
-            chunk_count: descriptor.chunk_count as i64,
+            bytes_total: descriptor.bytes_total as i64,
+            bytes_local: 0,
+            media_state: MediaState::RemoteOriginal,
+            wrapped_k_asset: vec![0u8; 40],
+            chunk_count: descriptor.chunk_count as i32,
             merkle_root: descriptor.merkle_root.to_vec(),
-            node_id: String::new(),
-            version_id: String::new(),
+            blob_id: blob_id.clone(),
             storage_sink: "kdrive".to_string(),
-            created_at_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64,
         };
-        self.db
-            .insert_media_asset(&asset)
-            .map_err(crate::Error::Storage)?;
 
-        // Store the message skeleton + body (with caption as text)
-        if let Some(cap) = caption {
-            let entry = MessageProcessor::create_outbox_entry(conversation_id, cap, None);
-            MessagePersister::persist_outbox_entry(&self.db, &entry)
-                .map_err(crate::Error::Storage)?;
+        {
+            let conn = self.db.write()?;
+            conn.execute_batch("SAVEPOINT send_media;")
+                .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
+
+            let insert_result = (|| {
+                conn.execute(
+                    "INSERT OR REPLACE INTO message_skeleton
+                     (message_id, conversation_id, sender_id, created_at_ms, received_at_ms, kind, body_state, media_state, archive_state, backup_state, reply_to, edited_at_ms, deleted_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    rusqlite::params![
+                        skeleton.message_id,
+                        skeleton.conversation_id,
+                        skeleton.sender_id,
+                        skeleton.created_at_ms,
+                        skeleton.received_at_ms,
+                        skeleton.kind.as_str(),
+                        skeleton.body_state.to_string(),
+                        skeleton.media_state.map(|s| s.to_string()),
+                        skeleton.archive_state.to_string(),
+                        skeleton.backup_state.to_string(),
+                        skeleton.reply_to,
+                        skeleton.edited_at_ms,
+                        skeleton.deleted_at_ms,
+                    ],
+                )?;
+                conn.execute(
+                    "INSERT OR REPLACE INTO message_body (message_id, text_content, detected_language, rich_meta)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        body.message_id,
+                        body.text_content,
+                        body.detected_language,
+                        body.rich_meta,
+                    ],
+                )?;
+                conn.execute(
+                    "INSERT OR REPLACE INTO media_asset
+                     (asset_id, message_id, mime_type, bytes_total, bytes_local, media_state, wrapped_k_asset, chunk_count, merkle_root, blob_id, storage_sink)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    rusqlite::params![
+                        asset.asset_id,
+                        asset.message_id,
+                        asset.mime_type,
+                        asset.bytes_total,
+                        asset.bytes_local,
+                        asset.media_state.to_string(),
+                        asset.wrapped_k_asset,
+                        asset.chunk_count,
+                        asset.merkle_root,
+                        asset.blob_id,
+                        asset.storage_sink,
+                    ],
+                )?;
+                Ok::<(), rusqlite::Error>(())
+            })();
+
+            match insert_result {
+                Ok(()) => {
+                    conn.execute_batch("RELEASE send_media;")
+                        .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK TO send_media; RELEASE send_media;");
+                    return Err(crate::Error::Storage(e.to_string().into()));
+                }
+            }
         }
 
-        // TODO: Upload media to kdrive via DriveFacade (requires signing keys)
-        // For now, we just store locally and return
+        // Upload encrypted media blob to the gateway via transport
+        let uploaded_blob_id = self
+            .transport
+            .upload_media_blob(&blob_id, &ciphertext)
+            .map_err(crate::Error::Transport)?;
 
         Ok(SendMediaResult {
             message_id: Uuid::parse_str(&message_id).unwrap_or_else(|_| Uuid::now_v7()),
-            asset_id: asset_id.clone(),
-            node_id: String::new(),
-            version_id: String::new(),
+            asset_id,
+            node_id: uploaded_blob_id.clone(),
+            version_id: uploaded_blob_id,
         })
     }
 }
@@ -394,4 +548,12 @@ fn mime_from_extension(path: &std::path::Path) -> String {
         Some("pdf") => "application/pdf".to_string(),
         _ => "application/octet-stream".to_string(),
     }
+}
+
+/// Current wall-clock time in milliseconds since Unix epoch.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }

@@ -8,9 +8,11 @@ use cs_core::media::processor::process_media;
 #[test]
 fn b2c_media_process_image() {
     let data = b"fake image data for processing test";
-    let descriptor = process_media("asset-1", "image/png", data, "", "").expect("process failed");
+    let asset_uuid = uuid::Uuid::now_v7();
+    let descriptor = process_media(&asset_uuid.to_string(), "image/png", data, "", "", "")
+        .expect("process failed");
 
-    assert_eq!(descriptor.asset_id, "asset-1");
+    assert_eq!(descriptor.asset_id, asset_uuid);
     assert_eq!(descriptor.mime_type, "image/png");
     assert!(descriptor.chunk_count > 0);
     assert!(
@@ -90,10 +92,19 @@ fn b2c_media_send_message() {
 
     // We test the media processing + DB storage directly since send_media
     // requires a CoreImpl with transport
-    let descriptor =
-        process_media("asset-send", "image/png", b"fake png data", "", "").expect("process failed");
+    let asset_uuid = uuid::Uuid::now_v7();
+    let descriptor = process_media(
+        &asset_uuid.to_string(),
+        "image/png",
+        b"fake png data",
+        "",
+        "",
+        "",
+    )
+    .expect("process failed");
 
     // Insert a skeleton first (FK constraint requires it)
+    use cs_core::local_store::state_machines::{ArchiveState, BackupState, BodyState, MediaState};
     use cs_core::local_store::{MessageKind, MessageSkeleton};
     let skeleton = MessageSkeleton {
         message_id: "msg-send".to_string(),
@@ -102,10 +113,10 @@ fn b2c_media_send_message() {
         created_at_ms: 1_700_000_000_000,
         received_at_ms: 1_700_000_001_000,
         kind: MessageKind::Media,
-        body_state: "local_plain_available".to_string(),
-        media_state: Some("original_local".to_string()),
-        archive_state: "not_archived".to_string(),
-        backup_state: "not_backed_up".to_string(),
+        body_state: BodyState::LocalPlainAvailable,
+        media_state: Some(MediaState::OriginalLocal),
+        archive_state: ArchiveState::NotArchived,
+        backup_state: BackupState::NotBackedUp,
         reply_to: None,
         edited_at_ms: None,
         deleted_at_ms: None,
@@ -114,28 +125,27 @@ fn b2c_media_send_message() {
         .expect("insert skeleton failed");
 
     let asset = cs_core::local_store::MediaAsset {
-        asset_id: "asset-send".to_string(),
+        asset_id: asset_uuid.to_string(),
         message_id: "msg-send".to_string(),
         mime_type: "image/png".to_string(),
         bytes_total: 13,
         bytes_local: 13,
-        media_state: "original_local".to_string(),
-        chunk_count: descriptor.chunk_count as i64,
+        media_state: MediaState::OriginalLocal,
+        wrapped_k_asset: vec![0u8; 40],
+        chunk_count: descriptor.chunk_count as i32,
         merkle_root: descriptor.merkle_root.to_vec(),
-        node_id: String::new(),
-        version_id: String::new(),
+        blob_id: asset_uuid.to_string(),
         storage_sink: "kdrive".to_string(),
-        created_at_ms: 1_700_000_000_000,
     };
     db.insert_media_asset(&asset).expect("insert failed");
 
     let fetched = db
-        .fetch_media_asset("asset-send")
+        .fetch_media_asset(&asset_uuid.to_string())
         .expect("fetch failed")
         .expect("asset missing");
     assert_eq!(fetched.mime_type, "image/png");
     assert_eq!(fetched.bytes_total, 13);
-    assert_eq!(fetched.media_state, "original_local");
+    assert_eq!(fetched.media_state, MediaState::OriginalLocal);
 
     let _ = gateway_url; // suppress unused warning
 }

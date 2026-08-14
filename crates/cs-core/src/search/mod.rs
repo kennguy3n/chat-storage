@@ -12,6 +12,20 @@ pub mod shard_prefetch;
 pub mod text_search;
 pub mod tokenizer;
 
+use serde::{Deserialize, Serialize};
+
+/// Internal encrypted shard frame (nonce + ciphertext + metadata).
+/// This is the simple internal representation used by shard builders
+/// and the LRU cache. The CBOR wire-format type is
+/// [`crate::formats::search_shard::SearchIndexShard`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchShardFrame {
+    pub nonce: [u8; 24],
+    pub ciphertext: Vec<u8>,
+    pub plaintext_hash: [u8; 32],
+    pub plaintext_size: u64,
+}
+
 /// Search errors.
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {

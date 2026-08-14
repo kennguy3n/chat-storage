@@ -1,7 +1,8 @@
 //! Cold shard source — fetch and decrypt encrypted search index shards from the gateway.
 
-use crate::formats::search_shard::{SearchShardFrame, ShardId};
+use crate::formats::search_shard::ShardId;
 use crate::search::SearchError;
+use crate::search::SearchShardFrame;
 use crate::transport::ChatStorageTransport;
 
 /// Source for cold (offloaded) search index shards.

@@ -1,6 +1,6 @@
 //! Archive upload — upload segments and manifests via kdrive transport.
 
-use crate::formats::archive_segment::ArchiveSegmentFrame;
+use crate::archive::types::ArchiveSegmentFrame;
 use crate::transport::ChatStorageTransport;
 
 /// Upload an archive segment to the gateway.

@@ -1,103 +1,113 @@
-//! AES-256-KW (Key Wrap) for wrapping epoch keys under root keys.
+//! AES-256-KW key wrapping (NIST 800-38F / RFC 3394).
 //!
-//! Uses AES-256-GCM with a zero-plaintext-length AAD for the key-wrap
-//! construction. This is a simplified key-wrap that provides
-//! confidentiality and integrity for stored key material.
+//! Implements the construction the higher layers depend on:
+//! a `K_asset` (32 bytes) wrapped under one of `K_local_db`,
+//! `K_archive_root`, or `K_backup_root` (also 32 bytes) so that the
+//! ciphertext alone never reveals the asset key. The wrapped output
+//! is exactly **40 bytes** — the input key plus an 8-byte integrity
+//! check value.
 
-use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
-    Aes256Gcm, Nonce as AesNonce,
-};
+use aes_kw::Kek;
 
-use super::{CryptoError, Key32, Nonce12};
+use super::{CryptoError, CryptoResult, Key32, KEY_LEN};
 
-/// Wrap a 32-byte key using AES-256-GCM.
-///
-/// Returns `nonce(12) || ciphertext(32) || tag(16)` = 60 bytes.
-pub fn wrap_key(wrapping_key: &Key32, key_to_wrap: &Key32) -> Result<Vec<u8>, CryptoError> {
-    use rand::RngCore;
-    let mut nonce = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
+/// AES-256-KW wrap of a 32-byte key produces 40 bytes (32 + 8-byte
+/// integrity check value).
+pub const WRAPPED_KEY_LEN: usize = KEY_LEN + 8;
 
-    let cipher = Aes256Gcm::new(wrapping_key.into());
-    let ct = cipher
-        .encrypt(
-            AesNonce::from_slice(&nonce),
-            Payload {
-                msg: key_to_wrap.as_slice(),
-                aad: b"chat-storage/key-wrap/v1",
-            },
-        )
-        .map_err(|e| CryptoError::KeyWrap(e.to_string()))?;
-
-    let mut out = Vec::with_capacity(12 + ct.len());
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&ct);
+/// Wrap `key_to_wrap` under `wrapping_key` using AES-256-KW
+/// (RFC 3394). Output is exactly [`WRAPPED_KEY_LEN`] bytes.
+pub fn wrap_key(wrapping_key: &Key32, key_to_wrap: &Key32) -> CryptoResult<Vec<u8>> {
+    let kek = Kek::from(*wrapping_key);
+    let mut out = vec![0u8; WRAPPED_KEY_LEN];
+    kek.wrap(key_to_wrap, &mut out)
+        .map_err(|_| CryptoError::KeyWrap("aes-kw wrap failed".into()))?;
     Ok(out)
 }
 
-/// Unwrap a wrapped key.
-///
-/// Input: `nonce(12) || ciphertext(32) || tag(16)` = 60 bytes.
-pub fn unwrap_key(wrapping_key: &Key32, wrapped: &[u8]) -> Result<Key32, CryptoError> {
-    if wrapped.len() < 12 + 16 + 32 {
-        return Err(CryptoError::KeyWrap(format!(
-            "wrapped key too short: {} bytes (need at least 60)",
-            wrapped.len()
-        )));
+/// Unwrap a 32-byte key from `wrapped_key` using AES-256-KW. The
+/// wrapped input must be exactly [`WRAPPED_KEY_LEN`] bytes.
+pub fn unwrap_key(wrapping_key: &Key32, wrapped_key: &[u8]) -> CryptoResult<Key32> {
+    if wrapped_key.len() != WRAPPED_KEY_LEN {
+        return Err(CryptoError::InvalidInput(
+            "aes-kw unwrap: wrapped key must be 40 bytes",
+        ));
     }
-
-    let nonce: Nonce12 = wrapped[..12].try_into().expect("checked length");
-    let ct = &wrapped[12..];
-
-    let cipher = Aes256Gcm::new(wrapping_key.into());
-    let pt = cipher
-        .decrypt(
-            AesNonce::from_slice(&nonce),
-            Payload {
-                msg: ct,
-                aad: b"chat-storage/key-wrap/v1",
-            },
-        )
-        .map_err(|e| CryptoError::KeyWrap(e.to_string()))?;
-
-    if pt.len() != 32 {
-        return Err(CryptoError::KeyWrap(format!(
-            "unwrapped key has wrong length: {} (expected 32)",
-            pt.len()
-        )));
-    }
-
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&pt);
-    Ok(key)
+    let kek = Kek::from(*wrapping_key);
+    let mut out = [0u8; KEY_LEN];
+    kek.unwrap(wrapped_key, &mut out)
+        .map_err(|_| CryptoError::KeyWrap("aes-kw unwrap failed".into()))?;
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_key_wrap_roundtrip() {
-        let wrapping_key = [0xABu8; 32];
-        let key_to_wrap = [0xCDu8; 32];
+    fn fresh_kek() -> Key32 {
+        let mut k = [0u8; KEY_LEN];
+        for (i, b) in k.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(31);
+        }
+        k
+    }
 
-        let wrapped = wrap_key(&wrapping_key, &key_to_wrap).unwrap();
-        assert_eq!(wrapped.len(), 60);
-
-        let unwrapped = unwrap_key(&wrapping_key, &wrapped).unwrap();
-        assert_eq!(unwrapped, key_to_wrap);
+    fn fresh_k_asset() -> Key32 {
+        let mut k = [0u8; KEY_LEN];
+        for (i, b) in k.iter_mut().enumerate() {
+            *b = (i as u8) ^ 0xA5;
+        }
+        k
     }
 
     #[test]
-    fn test_key_wrap_wrong_key_fails() {
-        let wrapping_key = [0xABu8; 32];
-        let wrong_key = [0xEFu8; 32];
-        let key_to_wrap = [0xCDu8; 32];
+    fn wrap_unwrap_round_trip() {
+        let kek = fresh_kek();
+        let k_asset = fresh_k_asset();
+        let wrapped = wrap_key(&kek, &k_asset).unwrap();
+        assert_eq!(wrapped.len(), WRAPPED_KEY_LEN);
+        let unwrapped = unwrap_key(&kek, &wrapped).unwrap();
+        assert_eq!(unwrapped, k_asset);
+    }
 
-        let wrapped = wrap_key(&wrapping_key, &key_to_wrap).unwrap();
-        let result = unwrap_key(&wrong_key, &wrapped);
+    #[test]
+    fn wrong_wrapping_key_is_rejected() {
+        let kek = fresh_kek();
+        let k_asset = fresh_k_asset();
+        let wrapped = wrap_key(&kek, &k_asset).unwrap();
 
-        assert!(result.is_err());
+        let mut wrong_kek = kek;
+        wrong_kek[0] ^= 0x01;
+        let res = unwrap_key(&wrong_kek, &wrapped);
+        assert!(res.is_err(), "wrong-KEK unwrap accepted: {res:?}");
+    }
+
+    #[test]
+    fn tampered_wrapped_key_is_rejected() {
+        let kek = fresh_kek();
+        let k_asset = fresh_k_asset();
+        let mut wrapped = wrap_key(&kek, &k_asset).unwrap();
+        let last = wrapped.len() - 1;
+        wrapped[last] ^= 0x01;
+        let res = unwrap_key(&kek, &wrapped);
+        assert!(res.is_err(), "tampered wrap accepted: {res:?}");
+    }
+
+    #[test]
+    fn wrong_length_wrapped_input_is_rejected() {
+        let kek = fresh_kek();
+        let too_short = vec![0u8; WRAPPED_KEY_LEN - 1];
+        assert!(unwrap_key(&kek, &too_short).is_err());
+        let too_long = vec![0u8; WRAPPED_KEY_LEN + 1];
+        assert!(unwrap_key(&kek, &too_long).is_err());
+    }
+
+    #[test]
+    fn wrap_is_deterministic() {
+        let kek = fresh_kek();
+        let k_asset = fresh_k_asset();
+        let a = wrap_key(&kek, &k_asset).unwrap();
+        let b = wrap_key(&kek, &k_asset).unwrap();
+        assert_eq!(a, b);
     }
 }

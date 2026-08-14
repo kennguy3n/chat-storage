@@ -1,7 +1,7 @@
 //! Archive segment builder — constructs encrypted archive segments from messages.
 
+use crate::archive::types::*;
 use crate::crypto::{self, Key32};
-use crate::formats::archive_segment::*;
 use crate::message::processor::IngestedMessage;
 
 /// Build an encrypted archive segment from a set of messages.
@@ -38,11 +38,11 @@ pub fn build_segment(
                 .media_descriptors
                 .iter()
                 .map(|d| MediaRef {
-                    asset_id: d.asset_id.clone(),
+                    asset_id: d.asset_id.to_string(),
                     mime_type: d.mime_type.clone(),
                     node_id: d.node_id.clone(),
                     version_id: d.version_id.clone(),
-                    bytes_total: 0,
+                    bytes_total: d.bytes_total,
                 })
                 .collect(),
         });

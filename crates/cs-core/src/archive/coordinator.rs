@@ -4,8 +4,10 @@ use crate::archive::epoch_keys::EpochKeyManager;
 use crate::archive::event_journal::{ArchiveEvent, ArchiveEventJournal};
 use crate::archive::manifest_builder::build_manifest;
 use crate::archive::segment_builder::build_segment;
+use crate::archive::types::ArchiveSegmentFrame;
 use crate::archive::upload::{upload_manifest, upload_segment};
-use crate::formats::archive_segment::ArchiveSegmentFrame;
+use crate::formats::manifest::{ManifestSegmentRef, WrappedEpochKeyRef};
+use crate::formats::SegmentType;
 use crate::message::processor::IngestedMessage;
 use crate::transport::ChatStorageTransport;
 
@@ -80,28 +82,26 @@ impl ArchiveCoordinator {
         let _epoch_id = self.epoch_manager.current_epoch();
 
         // Build SegmentRefs from pending segments
-        let segments: Vec<crate::formats::backup_manifest::SegmentRef> = self
+        let segments: Vec<ManifestSegmentRef> = self
             .pending_segments
             .iter()
-            .map(|(id, frame)| crate::formats::backup_manifest::SegmentRef {
-                segment_id: id.clone(),
-                storage_key: id.clone(),
+            .map(|(id, frame)| ManifestSegmentRef {
+                segment_id: uuid::Uuid::parse_str(id).unwrap_or_else(|_| uuid::Uuid::now_v7()),
+                segment_type: SegmentType::MessageDelta,
+                ciphertext_sha256: frame.plaintext_hash,
                 size: frame.ciphertext.len() as u64,
-                merkle_root: frame.plaintext_hash,
             })
             .collect();
 
         // Build wrapped epoch keys
-        let wrapped_keys: Vec<crate::formats::backup_manifest::WrappedEpochKey> = self
+        let wrapped_keys: Vec<WrappedEpochKeyRef> = self
             .epoch_manager
             .wrapped_prior_epochs()
             .iter()
-            .map(
-                |(epoch, wrapped)| crate::formats::backup_manifest::WrappedEpochKey {
-                    epoch_id: *epoch,
-                    wrapped_key: wrapped.clone(),
-                },
-            )
+            .map(|(epoch, wrapped)| WrappedEpochKeyRef {
+                epoch_id: epoch.to_string(),
+                wrapped_key: wrapped.clone(),
+            })
             .collect();
 
         let manifest = build_manifest(
@@ -112,7 +112,7 @@ impl ArchiveCoordinator {
         )?;
 
         // Encode and upload manifest
-        let manifest_bytes = serde_json::to_vec(&manifest)
+        let manifest_bytes = crate::cbor::to_vec(&manifest)
             .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
         upload_manifest(transport, &manifest_bytes)?;
 

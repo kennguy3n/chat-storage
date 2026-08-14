@@ -7,6 +7,7 @@ use cs_core::config::{
     PrivacyModeSerde, StorageBudgetConfig,
 };
 use cs_core::crypto::Key32;
+use cs_core::local_store::state_machines::{ArchiveState, BackupState, BodyState};
 use cs_core::local_store::{Conversation, LocalStoreDb, MessageBody, MessageKind, MessageSkeleton};
 use cs_core::message::processor::{IngestedMessage, MessagePersister, MessageProcessor};
 use cs_core::transport::kdrive_bridge::KdriveTransport;
@@ -52,8 +53,10 @@ pub fn make_core(
     let mut config = make_config(gateway_url, data_dir);
     config.tenant_id = Some(tenant_id.to_string());
     let wrapping_key = tenant_wrapping_key(tenant_id);
+    let auth_token = format!("test-token-{}", tenant_id);
     let transport: Arc<dyn ChatStorageTransport> = Arc::new(KdriveTransport::new(
         gateway_url.to_string(),
+        auth_token,
         tenant_id.to_string(),
         user_id.to_string(),
     ));
@@ -73,14 +76,17 @@ pub fn temp_dir() -> tempfile::TempDir {
 /// Create and insert a conversation.
 pub fn seed_conversation(db: &LocalStoreDb, conv_id: &str, scope: &str, tenant_id: Option<&str>) {
     let conv = Conversation {
-        id: conv_id.to_string(),
-        conversation_type: "direct".to_string(),
+        conversation_id: conv_id.to_string(),
+        title_cipher: None,
+        pinned: false,
+        muted: false,
+        last_message_id: None,
+        last_activity_ms: 1_700_000_000_000,
+        conversation_type: "dm".to_string(),
         scope: scope.to_string(),
-        tenant_id: tenant_id.map(|s| s.to_string()),
-        community_id: None,
-        domain_id: None,
-        name_encrypted: None,
-        created_at_ms: 1_700_000_000_000,
+        tenant_id: tenant_id.unwrap_or("").to_string(),
+        community_id: String::new(),
+        domain_id: String::new(),
     };
     db.insert_conversation(&conv)
         .expect("failed to insert conversation");
@@ -104,7 +110,9 @@ pub fn ingest_one(
         reply_to: None,
     };
     MessageProcessor::validate(&msg).expect("validation failed");
-    MessagePersister::ingest_remote(db, &msg).expect("ingest failed");
+    MessagePersister::new(db)
+        .persist_ingested_message(&msg)
+        .expect("ingest failed");
     msg.message_id
 }
 
@@ -164,10 +172,10 @@ pub fn insert_skeleton(
         created_at_ms,
         received_at_ms: created_at_ms + 100,
         kind,
-        body_state: "local_plain_available".to_string(),
+        body_state: BodyState::LocalPlainAvailable,
         media_state: None,
-        archive_state: "not_archived".to_string(),
-        backup_state: "not_backed_up".to_string(),
+        archive_state: ArchiveState::NotArchived,
+        backup_state: BackupState::NotBackedUp,
         reply_to: None,
         edited_at_ms: None,
         deleted_at_ms: None,
@@ -183,6 +191,7 @@ pub fn insert_body(db: &LocalStoreDb, message_id: &str, text: &str) {
         message_id: message_id.to_string(),
         text_content: Some(text.to_string()),
         detected_language: Some("en".to_string()),
+        rich_meta: None,
     };
     db.insert_body(&body).expect("failed to insert body");
 }
@@ -201,7 +210,7 @@ pub fn mark_deleted(db: &LocalStoreDb, message_id: &str) {
 pub fn mark_archived(db: &LocalStoreDb, message_id: &str) {
     let conn = db.write().expect("failed to get write lock");
     conn.execute(
-        "UPDATE message_skeleton SET archive_state = 'archived' WHERE message_id = ?1",
+        "UPDATE message_skeleton SET archive_state = 'archive_verified' WHERE message_id = ?1",
         rusqlite::params![message_id],
     )
     .expect("failed to mark archived");

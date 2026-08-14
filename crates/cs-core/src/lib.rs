@@ -19,6 +19,7 @@
 
 pub mod archive;
 pub mod backup;
+pub mod cbor;
 pub mod config;
 pub mod core_impl;
 pub mod crypto;

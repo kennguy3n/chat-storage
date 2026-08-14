@@ -1,11 +1,11 @@
 //! Restore pipeline — skeleton-first restore.
 
 use crate::archive::epoch_keys::EpochKeyManager;
-use crate::archive::segment_builder::open_segment;
+use crate::backup::segment_builder::open_segment;
+use crate::backup::snapshot::BackupSnapshot;
 use crate::crypto::Key32;
-use crate::formats::archive_segment::ArchiveSegmentFrame;
-use crate::formats::backup_manifest::{decode_payload, BackupManifestPayload};
-use crate::restore::key_recovery::recover_epoch_key;
+use crate::formats::manifest::BackupManifest;
+use crate::local_store::LocalStoreDb;
 use crate::restore::manifest_verifier::verify_chain;
 use crate::restore::RestoreState;
 use crate::transport::ChatStorageTransport;
@@ -20,7 +20,7 @@ pub struct RestorePipeline {
 impl RestorePipeline {
     pub fn new() -> Self {
         Self {
-            state: RestoreState::NotStarted,
+            state: RestoreState::IdentityRestored,
         }
     }
 
@@ -28,17 +28,26 @@ impl RestorePipeline {
         self.state
     }
 
+    fn transition(&mut self, to: RestoreState) -> Result<(), crate::Error> {
+        self.state = RestoreState::try_transition(self.state, to)
+            .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
+        Ok(())
+    }
+
     /// Execute the full restore pipeline.
     ///
     /// `wrapping_key` is the KDRV1 DomainKey (or ShareGrantKey) from which
-    /// the archive root key is derived to unwrap epoch keys and decrypt segments.
+    /// the backup root key is derived to decrypt segments.
+    /// `db` is the local store where restored data is inserted and search indexes
+    /// are rebuilt.
     pub fn execute(
         &mut self,
         _source: &BackupSource,
         wrapping_key: &Key32,
         transport: &dyn ChatStorageTransport,
+        db: &LocalStoreDb,
     ) -> Result<RestoreResult, crate::Error> {
-        self.state = RestoreState::FetchingManifests;
+        self.transition(RestoreState::RootKeysUnwrapped)?;
 
         // 1. Fetch manifests from the gateway
         let manifest_bytes = transport
@@ -46,91 +55,115 @@ impl RestorePipeline {
             .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
 
         if manifest_bytes.is_empty() {
+            self.transition(RestoreState::ManifestVerified)?;
+            self.transition(RestoreState::SkeletonRestored)?;
+            self.transition(RestoreState::SearchRestored)?;
+            self.transition(RestoreState::RecentMessagesRestored)?;
+            self.transition(RestoreState::MediaLazyRestoreEnabled)?;
+            self.transition(RestoreState::FullRestoreComplete)?;
             return Ok(RestoreResult::default());
         }
 
         // 2. Decode manifests
-        let mut manifests: Vec<BackupManifestPayload> = Vec::new();
+        let mut manifests: Vec<BackupManifest> = Vec::new();
         for bytes in &manifest_bytes {
-            let payload = decode_payload(bytes)?;
+            let payload: BackupManifest = crate::cbor::from_slice(bytes)
+                .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
             manifests.push(payload);
         }
 
-        self.state = RestoreState::FetchingSkeletons;
-
         // 3. Verify manifest chain
         verify_chain(&manifests)?;
-
-        self.state = RestoreState::FetchingBodies;
+        self.transition(RestoreState::ManifestVerified)?;
 
         // 4. Set up epoch key manager for decryption
         let epoch_mgr = EpochKeyManager::new(wrapping_key);
 
-        // 5. Download and decrypt segments
-        let mut messages_restored = 0;
+        // 5. Download and decrypt backup segments
+        let mut all_payloads: Vec<Vec<u8>> = Vec::new();
+
         for manifest in &manifests {
             for seg_ref in &manifest.segments {
+                let seg_id_str = seg_ref.segment_id.to_string();
                 let ciphertext = transport
-                    .download_archive_segment(&seg_ref.segment_id)
+                    .download_backup_segment(&seg_id_str)
                     .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
 
-                // Derive segment key: epoch key → segment key
-                // We need to know which epoch this segment belongs to.
-                // The manifest's wrapped_epoch_keys tell us which epochs are available.
-                // Try each wrapped epoch key until decryption succeeds.
-                let mut decrypted = false;
-                for wrapped in &manifest.wrapped_epoch_keys {
-                    if let Ok(epoch_key) = recover_epoch_key(
-                        &crate::crypto::key_bridge::derive_archive_root(wrapping_key),
-                        &wrapped.wrapped_key,
-                    ) {
-                        let segment_key = crate::crypto::key_bridge::derive_archive_segment(
-                            &epoch_key,
-                            seg_ref.segment_id.as_bytes(),
-                        );
+                // Derive segment key from epoch key
+                let epoch_key = epoch_mgr.current_epoch_key();
+                let segment_key = crate::crypto::key_bridge::derive_archive_segment(
+                    &epoch_key,
+                    seg_ref.segment_id.as_bytes(),
+                );
 
-                        // Parse the ciphertext as an ArchiveSegmentFrame
-                        // The frame is CBOR/JSON-encoded (nonce + ciphertext + hash + size)
-                        if let Ok(frame) =
-                            serde_json::from_slice::<ArchiveSegmentFrame>(&ciphertext)
-                        {
-                            if let Ok(payload) = open_segment(&frame, &segment_key) {
-                                messages_restored += payload.entries.len();
-                                decrypted = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if !decrypted {
-                    // Try current epoch key directly
-                    let epoch_key = epoch_mgr.current_epoch_key();
-                    let segment_key = crate::crypto::key_bridge::derive_archive_segment(
-                        &epoch_key,
-                        seg_ref.segment_id.as_bytes(),
-                    );
-                    if let Ok(frame) = serde_json::from_slice::<ArchiveSegmentFrame>(&ciphertext) {
-                        if let Ok(payload) = open_segment(&frame, &segment_key) {
-                            messages_restored += payload.entries.len();
-                        }
+                // Decrypt backup segment (self-contained frame: nonce + ciphertext)
+                match open_segment(&ciphertext, &segment_key) {
+                    Ok(plaintext) => all_payloads.push(plaintext),
+                    Err(e) => {
+                        return Err(crate::Error::Storage(
+                            format!("backup segment decryption failed for {seg_id_str}: {e}")
+                                .into(),
+                        ));
                     }
                 }
             }
         }
 
-        self.state = RestoreState::FetchingMedia;
+        // 6. Clear existing data before restore to avoid silent merges
+        db.clear_all_message_data()?;
 
-        self.state = RestoreState::BuildingIndexes;
+        // 7. Deserialize backup snapshots from decrypted payloads and insert into DB
+        self.transition(RestoreState::SkeletonRestored)?;
 
-        // 6. Rebuild search indexes (stub — would re-index FTS5 + fuzzy)
-        self.state = RestoreState::Complete;
+        let mut messages_restored = 0usize;
+        let mut conversations_restored = 0usize;
+        let mut search_indexes_rebuilt = 0usize;
+
+        for payload_bytes in &all_payloads {
+            let snapshot = BackupSnapshot::from_cbor(payload_bytes)?;
+
+            // Insert conversations
+            for conv in &snapshot.conversations {
+                db.insert_conversation(conv)?;
+                conversations_restored += 1;
+            }
+
+            // Insert skeletons
+            for skel in &snapshot.skeletons {
+                db.insert_skeleton(skel)?;
+                messages_restored += 1;
+            }
+
+            // Insert bodies and rebuild search indexes
+            for body in &snapshot.bodies {
+                db.insert_body(body)?;
+                if let Some(ref text) = body.text_content {
+                    // Find the skeleton to get conversation_id, sender_id, created_at_ms
+                    if let Ok(Some(skel)) = db.get_message_skeleton(&body.message_id) {
+                        db.reindex_message(
+                            &body.message_id,
+                            &skel.conversation_id,
+                            &skel.sender_id,
+                            skel.created_at_ms,
+                            text,
+                        )?;
+                        search_indexes_rebuilt += 1;
+                    }
+                }
+            }
+        }
+
+        // 8. Advance through remaining states
+        self.transition(RestoreState::SearchRestored)?;
+        self.transition(RestoreState::RecentMessagesRestored)?;
+        self.transition(RestoreState::MediaLazyRestoreEnabled)?;
+        self.transition(RestoreState::FullRestoreComplete)?;
 
         Ok(RestoreResult {
-            conversations_restored: 0,
+            conversations_restored,
             messages_restored,
             media_restored: 0,
-            search_indexes_rebuilt: 0,
+            search_indexes_rebuilt,
         })
     }
 }

@@ -2,7 +2,9 @@
 
 pub mod processor;
 
-pub use processor::{IngestedMessage, MessagePersister, MessageProcessor, OutboxEntry};
+pub use processor::{
+    IngestedMessage, MessagePersister, MessageProcessor, OutboxEntry, OutboxStatus, ProcessorError,
+};
 
 /// Message pipeline errors.
 #[derive(Debug, thiserror::Error)]

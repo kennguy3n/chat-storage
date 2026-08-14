@@ -1,10 +1,10 @@
 //! Manifest verifier — verify manifest chain integrity.
 
-use crate::formats::backup_manifest::*;
+use crate::formats::manifest::BackupManifest;
 use crate::local_store::StorageError;
 
 /// Verify the manifest chain: check `previous_manifest_hash` links.
-pub fn verify_chain(manifests: &[BackupManifestPayload]) -> Result<(), crate::Error> {
+pub fn verify_chain(manifests: &[BackupManifest]) -> Result<(), crate::Error> {
     if manifests.is_empty() {
         return Ok(());
     }

@@ -76,7 +76,10 @@ fn b2c_eviction_updates_state() {
         .fetch_skeleton(&id)
         .expect("fetch failed")
         .expect("skeleton missing");
-    assert_eq!(skeleton.body_state, "remote_archive_only");
+    assert_eq!(
+        skeleton.body_state,
+        cs_core::local_store::state_machines::BodyState::RemoteArchiveOnly
+    );
 }
 
 #[test]

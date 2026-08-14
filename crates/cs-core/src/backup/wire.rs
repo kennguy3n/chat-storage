@@ -1,13 +1,13 @@
 //! Backup wire format helpers.
 
-use crate::formats::backup_manifest::*;
+use crate::formats::manifest::BackupManifest;
 
-/// Encode a manifest payload for transmission.
-pub fn encode_manifest(payload: &BackupManifestPayload) -> Result<Vec<u8>, crate::Error> {
-    encode_payload(payload)
+/// Encode a manifest for transmission.
+pub fn encode_manifest(manifest: &BackupManifest) -> Result<Vec<u8>, crate::Error> {
+    crate::cbor::to_vec(manifest).map_err(|e| crate::Error::Storage(e.to_string().into()))
 }
 
-/// Decode a manifest payload from received data.
-pub fn decode_manifest(data: &[u8]) -> Result<BackupManifestPayload, crate::Error> {
-    decode_payload(data)
+/// Decode a manifest from received data.
+pub fn decode_manifest(data: &[u8]) -> Result<BackupManifest, crate::Error> {
+    crate::cbor::from_slice(data).map_err(|e| crate::Error::Storage(e.to_string().into()))
 }

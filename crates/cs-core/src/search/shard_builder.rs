@@ -1,7 +1,10 @@
 //! Search index shard builder — builds encrypted FTS/fuzzy/vector/media/bloom shards.
 
 use crate::crypto::{self, Key32};
-use crate::formats::search_shard::*;
+use crate::formats::search_shard::{
+    BloomShardPayload, FuzzyShardEntry, FuzzyShardPayload, TextShardEntry, TextShardPayload,
+};
+use crate::search::SearchShardFrame;
 
 /// Build an encrypted text shard from a set of text entries.
 pub fn build_text_shard(
