@@ -1,0 +1,21 @@
+[package]
+name = "cs-core-napi"
+description = "Electron native addon (NAPI-RS) for KChat chat-storage."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cs-core = { path = "../cs-core" }
+napi = { version = "3", features = ["napi6"] }
+napi-derive = "3"
+hex = "0.4"
+uuid = { version = "1", features = ["v4", "v7"] }
+serde_json = "1"
+
+[build-dependencies]
+napi-build = "2"
