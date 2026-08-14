@@ -90,3 +90,53 @@ impl From<kchat_core::error::CoreError> for ModelError {
         ModelError::Custom(e.to_string())
     }
 }
+
+#[cfg(feature = "ml-vision")]
+impl From<kchat_safety::vision::MobileClipSessionError> for ModelError {
+    fn from(e: kchat_safety::vision::MobileClipSessionError) -> Self {
+        match e {
+            kchat_safety::vision::MobileClipSessionError::LoadFailed { reason } => {
+                ModelError::Load(reason)
+            }
+            kchat_safety::vision::MobileClipSessionError::InvalidGraph { reason } => {
+                ModelError::Load(reason)
+            }
+            kchat_safety::vision::MobileClipSessionError::TensorBuildFailed { reason } => {
+                ModelError::Ort {
+                    op: "mobileclip_tensor_build",
+                    detail: reason,
+                }
+            }
+            kchat_safety::vision::MobileClipSessionError::InferenceFailed { reason } => {
+                ModelError::Inference(reason)
+            }
+            kchat_safety::vision::MobileClipSessionError::UnexpectedOutputShape { got } => {
+                ModelError::Inference(format!("unexpected output shape: {got:?}"))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "ml-vision")]
+impl From<kchat_safety::vision::VisionEncoderError> for ModelError {
+    fn from(e: kchat_safety::vision::VisionEncoderError) -> Self {
+        ModelError::Inference(e.to_string())
+    }
+}
+
+#[cfg(feature = "ml-vision")]
+impl From<kchat_safety::vision::VisionImagePreprocessError> for ModelError {
+    fn from(e: kchat_safety::vision::VisionImagePreprocessError) -> Self {
+        ModelError::MediaDecode {
+            op: "vision_preprocess",
+            detail: e.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "ml-vision")]
+impl From<kchat_safety::vision::FrameAggregationError> for ModelError {
+    fn from(e: kchat_safety::vision::FrameAggregationError) -> Self {
+        ModelError::Inference(e.to_string())
+    }
+}
