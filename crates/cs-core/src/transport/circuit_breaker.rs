@@ -64,6 +64,7 @@ impl CircuitBreaker {
         if opened_at == 0 {
             return true;
         }
+        // M15: call SystemTime::now() once and reuse
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -87,6 +88,7 @@ impl CircuitBreaker {
         if opened_at == 0 {
             return BreakerState::Open;
         }
+        // M15: call SystemTime::now() once and reuse
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

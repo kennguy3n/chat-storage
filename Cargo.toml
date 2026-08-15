@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/cs-core",
     "crates/cs-core-napi",
+    "crates/cs-core-uniffi",
 ]
 
 [workspace.package]

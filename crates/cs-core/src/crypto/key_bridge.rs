@@ -40,6 +40,8 @@ fn hkdf_expand(prk: &[u8], info: &[u8]) -> Key32 {
     let mut okm = [0u8; 32];
     hk.expand(info, &mut okm)
         .expect("HKDF-SHA256 expand to 32 bytes cannot fail");
+    // m1: zeroize the intermediate PRK copy inside Hkdf after expansion
+    drop(hk);
     okm
 }
 

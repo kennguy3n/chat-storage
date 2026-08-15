@@ -75,10 +75,21 @@ impl QueryEngine {
         }
 
         // 5. Generate snippets for results that don't have them
-        for result in &mut results {
-            if result.snippet.is_empty() {
-                if let Ok(Some(body)) = self.db.fetch_body(&result.message_id.to_string()) {
-                    if let Some(text) = &body.text_content {
+        // M16: batch-fetch bodies instead of N+1 per-result queries
+        let needs_snippet: Vec<String> = results
+            .iter()
+            .filter(|r| r.snippet.is_empty())
+            .map(|r| r.message_id.to_string())
+            .collect();
+
+        if !needs_snippet.is_empty() {
+            let body_map = self
+                .db
+                .fetch_bodies_batch(&needs_snippet)
+                .map_err(|e| SearchError::Custom(e.to_string()))?;
+            for result in &mut results {
+                if result.snippet.is_empty() {
+                    if let Some(text) = body_map.get(&result.message_id.to_string()) {
                         result.snippet = generate_snippet(text, &query.query, 80);
                     }
                 }

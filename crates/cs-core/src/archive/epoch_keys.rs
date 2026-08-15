@@ -64,6 +64,21 @@ impl EpochKeyManager {
     pub fn wrapped_prior_epochs(&self) -> &[(u64, Vec<u8>)] {
         &self.wrapped_prior_epochs
     }
+
+    /// M6: Prune old epoch key entries, keeping only the last `keep_count`.
+    /// Defaults to keeping 12 entries.
+    pub fn prune_old_epochs(&mut self, keep_count: usize) {
+        let keep_count = keep_count.max(1);
+        if self.wrapped_prior_epochs.len() > keep_count {
+            let start = self.wrapped_prior_epochs.len() - keep_count;
+            self.wrapped_prior_epochs = self.wrapped_prior_epochs.split_off(start);
+        }
+    }
+
+    /// M6: Prune old epoch key entries, keeping the default of 12 entries.
+    pub fn prune_old_epochs_default(&mut self) {
+        self.prune_old_epochs(12);
+    }
 }
 
 /// Compute the current epoch ID based on monthly rotation.

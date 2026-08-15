@@ -24,6 +24,9 @@ pub struct ArchiveCoordinator {
     prev_manifest_hash: [u8; 32],
 }
 
+/// M5: Maximum number of pending segments before forcing a flush.
+const MAX_PENDING_SEGMENTS: usize = 100;
+
 impl ArchiveCoordinator {
     pub fn new(wrapping_key: &[u8; 32]) -> Self {
         Self {
@@ -65,6 +68,15 @@ impl ArchiveCoordinator {
         });
 
         // Queue for manifest
+        // M5: check pending segment cap and return error if exceeded
+        if self.pending_segments.len() >= MAX_PENDING_SEGMENTS {
+            return Err(crate::Error::Storage(
+                format!(
+                    "pending segment cap reached ({MAX_PENDING_SEGMENTS}) — call finalize_epoch first"
+                )
+                .into(),
+            ));
+        }
         self.pending_segments.push((uploaded_id.clone(), frame));
 
         Ok(uploaded_id)

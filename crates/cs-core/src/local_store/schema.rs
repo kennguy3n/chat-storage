@@ -58,6 +58,14 @@ CREATE TABLE IF NOT EXISTS message_skeleton (
 CREATE INDEX IF NOT EXISTS idx_skeleton_conv_time
     ON message_skeleton (conversation_id, created_at_ms DESC);
 
+-- M17: Additional indexes for backup, archive, and sender queries
+CREATE INDEX IF NOT EXISTS idx_skeleton_backup_state
+    ON message_skeleton(backup_state) WHERE backup_state = 'not_backed_up';
+CREATE INDEX IF NOT EXISTS idx_skeleton_archive_state
+    ON message_skeleton(archive_state, created_at_ms);
+CREATE INDEX IF NOT EXISTS idx_skeleton_sender
+    ON message_skeleton(conversation_id, sender_id, created_at_ms);
+
 CREATE TABLE IF NOT EXISTS message_body (
     message_id        TEXT PRIMARY KEY REFERENCES message_skeleton(message_id),
     text_content      TEXT,                 -- UTF-8, may mix scripts
@@ -86,7 +94,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
     sender_id         UNINDEXED,
     created_at_ms     UNINDEXED,
     text_content,
-    tokenize = 'unicode61 remove_diacritics 2'
+    tokenize = 'unicode61 remove_diacritics 2',
+    detail = 'full'
 );
 
 CREATE TABLE IF NOT EXISTS search_fuzzy (
@@ -120,6 +129,15 @@ CREATE TABLE IF NOT EXISTS backup_event_journal (
     message_id      TEXT,
     payload         BLOB NOT NULL,            -- CBOR
     created_at_ms   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_backup_event_journal_created
+    ON backup_event_journal(created_at_ms);
+
+-- m6: Persisted backup coordinator state (single-row table)
+CREATE TABLE IF NOT EXISTS backup_state (
+    id                  INTEGER PRIMARY KEY CHECK (id = 1),
+    current_generation  INTEGER NOT NULL,
+    prev_manifest_hash  BLOB NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS backup_event_cursor (
@@ -217,6 +235,7 @@ pub const TABLES: &[&str] = &[
     "media_search_index",
     "backup_event_journal",
     "backup_event_cursor",
+    "backup_state",
     "archive_segment_map",
     "archive_event_journal",
     "archive_event_cursor",

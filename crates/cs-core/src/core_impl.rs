@@ -34,6 +34,10 @@ pub struct CoreImpl {
     transport: Arc<dyn ChatStorageTransport>,
     wrapping_key: Key32,
     backup_coordinator: Mutex<BackupCoordinator>,
+    /// Timestamp (ms since epoch) of the last storage-budget enforcement.
+    /// Used to throttle auto-triggered enforcement so it runs at most once
+    /// per 60 seconds.
+    last_enforcement_ms: Mutex<Option<i64>>,
 }
 
 impl CoreImpl {
@@ -64,6 +68,7 @@ impl CoreImpl {
             transport,
             wrapping_key,
             backup_coordinator: Mutex::new(BackupCoordinator::new()),
+            last_enforcement_ms: Mutex::new(None),
         })
     }
 
@@ -131,6 +136,32 @@ impl CoreImpl {
                     result.duplicate_count += 1;
                 }
                 Err(e) => return Err(crate::Error::from(e)),
+            }
+        }
+
+        // M19: auto-trigger storage budget enforcement if DB exceeds 80% of max.
+        // A 60-second cooldown prevents repeated enforcement when ingestion
+        // doesn't actually reduce the DB size (e.g. nothing is evictable).
+        if let Some(ref budget_cfg) = self.config.storage_budget {
+            let max_db = budget_cfg.max_db_bytes;
+            if max_db > 0 {
+                if let Ok(db_bytes) = self.db.db_size_bytes() {
+                    if db_bytes > max_db * 80 / 100 {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64;
+                        let should_enforce = {
+                            let guard = self.last_enforcement_ms.lock().unwrap();
+                            guard.map_or(true, |last| now - last > 60_000)
+                        };
+                        if should_enforce {
+                            let _ =
+                                self.enforce_storage_budget(StoragePressureReason::BudgetThreshold);
+                            *self.last_enforcement_ms.lock().unwrap() = Some(now);
+                        }
+                    }
+                }
             }
         }
 
@@ -211,6 +242,7 @@ impl CoreImpl {
 
         // Collect actual data from the local store — serialize conversations,
         // message skeletons, and bodies into a CBOR backup snapshot.
+        #[allow(deprecated)]
         let snapshot = crate::backup::snapshot::BackupSnapshot::from_db(&self.db)?;
         let data = snapshot.to_cbor()?;
 
@@ -218,14 +250,48 @@ impl CoreImpl {
             return Ok(BackupResult::default());
         }
 
-        let mut coordinator = self
-            .backup_coordinator
-            .lock()
-            .map_err(|_| crate::Error::Storage("backup coordinator lock poisoned".into()))?;
-        let generation = coordinator.run_backup(&data, &backup_key, self.transport.as_ref())?;
+        // Phase 1 (under lock): build segment + manifest payloads
+        let payload = {
+            let mut coordinator = self
+                .backup_coordinator
+                .lock()
+                .map_err(|_| crate::Error::Storage("backup coordinator lock poisoned".into()))?;
+            coordinator.prepare_backup(&data, &backup_key)?
+        };
+
+        // Phase 2 (no lock): upload segment + manifest over the network.
+        // Releasing the lock here ensures a slow/hung transport does not
+        // block other callers that need the coordinator.
+        let uploaded_id =
+            crate::backup::sinks::kdrive_sink::upload_segment(
+                self.transport.as_ref(),
+                &payload.segment_id,
+                &payload.ciphertext,
+            )?;
+        crate::backup::sinks::kdrive_sink::upload_manifest(
+            self.transport.as_ref(),
+            &payload.manifest_bytes,
+        )?;
+
+        // Phase 3 (under lock): record events + advance generation
+        let generation = {
+            let mut coordinator = self
+                .backup_coordinator
+                .lock()
+                .map_err(|_| crate::Error::Storage("backup coordinator lock poisoned".into()))?;
+            coordinator.finalize_backup(uploaded_id, payload)
+        };
 
         // Mark all backed-up skeletons as backed_up
         snapshot.mark_backed_up(&self.db)?;
+
+        // Prune backup event journal entries older than 30 days.
+        let cutoff = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64
+            - (30 * 24 * 60 * 60 * 1000);
+        let _ = self.db.prune_backup_events(cutoff);
 
         Ok(BackupResult {
             segments_built: 1,
@@ -364,15 +430,61 @@ impl CoreImpl {
         local_file: &std::path::Path,
         caption: Option<&str>,
     ) -> Result<SendMediaResult, crate::Error> {
+        // C5: check file size before loading into memory — reject if > 200MB
+        const MAX_MEDIA_SIZE: u64 = 200 * 1024 * 1024; // 200 MB
+        let metadata = std::fs::metadata(local_file)
+            .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
+        let file_size = metadata.len();
+        if file_size > MAX_MEDIA_SIZE {
+            return Err(crate::Error::Storage(
+                format!(
+                    "media file too large: {} bytes (max {} bytes / 200MB)",
+                    file_size, MAX_MEDIA_SIZE
+                )
+                .into(),
+            ));
+        }
+        let plaintext =
+            std::fs::read(local_file).map_err(|e| crate::Error::Storage(e.to_string().into()))?;
+        let mime_type = mime_from_extension(local_file);
+        self.send_media_inner(conversation_id, plaintext, &mime_type, caption)
+    }
+
+    /// Send a media message from in-memory bytes (no file path required).
+    ///
+    /// This is the iOS-friendly variant of [`send_media`](Self::send_media).
+    /// On iOS, media data comes from `PhotosPicker` or `UIDocumentPickerViewController`
+    /// as `Data` bytes, not file paths. The caller provides the raw plaintext
+    /// bytes and the MIME type (e.g. `"image/jpeg"`, `"video/mp4"`).
+    ///
+    /// The encryption, chunking, upload, and local store insertion logic is
+    /// identical to `send_media` — both delegate to `send_media_inner`.
+    pub fn send_media_bytes(
+        &self,
+        conversation_id: Uuid,
+        plaintext: Vec<u8>,
+        mime_type: &str,
+        caption: Option<&str>,
+    ) -> Result<SendMediaResult, crate::Error> {
+        self.send_media_inner(conversation_id, plaintext, mime_type, caption)
+    }
+
+    /// Shared inner logic for `send_media` and `send_media_bytes`.
+    ///
+    /// Takes already-read plaintext bytes + mime type, handles encryption,
+    /// DB insertion, and upload.
+    fn send_media_inner(
+        &self,
+        conversation_id: Uuid,
+        mut plaintext: Vec<u8>,
+        mime_type: &str,
+        caption: Option<&str>,
+    ) -> Result<SendMediaResult, crate::Error> {
         use crate::local_store::state_machines::{
             ArchiveState, BackupState, BodyState, MediaState,
         };
         use crate::local_store::{MessageKind, MessageSkeleton};
 
-        let mut plaintext =
-            std::fs::read(local_file).map_err(|e| crate::Error::Storage(e.to_string().into()))?;
-
-        let mime_type = mime_from_extension(local_file);
         let asset_id = uuid::Uuid::now_v7().to_string();
         let message_id = uuid::Uuid::now_v7().to_string();
         let blob_id = uuid::Uuid::now_v7().to_string();
@@ -380,7 +492,7 @@ impl CoreImpl {
 
         // Process media (compute chunk count, merkle root, etc.)
         let descriptor = crate::media::processor::process_media(
-            &asset_id, &mime_type, &plaintext, &blob_id, &blob_id, &blob_id,
+            &asset_id, mime_type, &plaintext, &blob_id, &blob_id, &blob_id,
         )?;
 
         // Encrypt the media plaintext using a per-asset media key
@@ -430,7 +542,7 @@ impl CoreImpl {
         let asset = crate::local_store::MediaAsset {
             asset_id: asset_id.clone(),
             message_id: message_id.clone(),
-            mime_type: mime_type.clone(),
+            mime_type: mime_type.to_string(),
             bytes_total: descriptor.bytes_total as i64,
             bytes_local: 0,
             media_state: MediaState::RemoteOriginal,
@@ -504,7 +616,17 @@ impl CoreImpl {
                         .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
                 }
                 Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK TO send_media; RELEASE send_media;");
+                    if let Err(rb_err) =
+                        conn.execute_batch("ROLLBACK TO send_media; RELEASE send_media;")
+                    {
+                        // Log the rollback failure — the database may be in
+                        // an inconsistent state. We still return the original
+                        // error so the caller knows the insert failed.
+                        eprintln!(
+                            "send_media: rollback failed after insert error: {} (original: {})",
+                            rb_err, e
+                        );
+                    }
                     return Err(crate::Error::Storage(e.to_string().into()));
                 }
             }

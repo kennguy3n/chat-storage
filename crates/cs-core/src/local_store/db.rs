@@ -1,18 +1,30 @@
 //! SQLCipher database connection and operations.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use rusqlite::Connection;
 
 use super::state_machines::{ArchiveState, BodyState, MediaState};
-use super::{schema::SCHEMA_SQL, StorageError};
+use super::{
+    schema::{LATEST_USER_VERSION, MIGRATIONS, SCHEMA_SQL},
+    StorageError,
+};
 use std::str::FromStr;
+
+/// Number of read-only connections in the pool.
+const READ_POOL_SIZE: usize = 3;
 
 /// The local encrypted store. Owns a write connection and a pool of
 /// read-only connections.
 #[derive(Debug)]
 pub struct LocalStoreDb {
     write_conn: Mutex<Connection>,
+    /// Pool of read-only connections for concurrent reads.
+    /// Empty for in-memory databases (which can't share data across connections).
+    read_conns: Vec<Mutex<Connection>>,
+    /// Round-robin index into `read_conns`.
+    read_idx: Mutex<usize>,
 }
 
 impl LocalStoreDb {
@@ -21,17 +33,39 @@ impl LocalStoreDb {
     pub fn open(path: &str, key: &[u8; 32]) -> Result<Self, StorageError> {
         let conn = Connection::open(path)?;
         Self::init_connection(&conn, key)?;
+
+        // Create read-only connection pool for concurrent reads.
+        // The write connection has already created the file and schema,
+        // so read-only connections can open successfully.
+        let mut read_conns = Vec::with_capacity(READ_POOL_SIZE);
+        for _ in 0..READ_POOL_SIZE {
+            let read_conn = Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            Self::init_read_connection(&read_conn, key)?;
+            read_conns.push(Mutex::new(read_conn));
+        }
+
         Ok(Self {
             write_conn: Mutex::new(conn),
+            read_conns,
+            read_idx: Mutex::new(0),
         })
     }
 
     /// Open an in-memory encrypted database (for tests).
+    ///
+    /// In-memory databases cannot share data across connections, so no
+    /// read pool is created — `read()` falls back to the write connection.
     pub fn open_in_memory(key: &[u8; 32]) -> Result<Self, StorageError> {
         let conn = Connection::open_in_memory()?;
         Self::init_connection(&conn, key)?;
         Ok(Self {
             write_conn: Mutex::new(conn),
+            read_conns: Vec::new(),
+            read_idx: Mutex::new(0),
         })
     }
 
@@ -44,7 +78,66 @@ impl LocalStoreDb {
         conn.pragma_update(None, "cache_size", -65536)?; // 64MB cache
         conn.pragma_update(None, "temp_store", "MEMORY")?;
         conn.pragma_update(None, "busy_timeout", 5000)?; // 5s timeout
-        conn.execute_batch(SCHEMA_SQL)?;
+        // C12: additional performance pragmas
+        conn.pragma_update(None, "mmap_size", 268435456)?; // 256MB memory-mapped I/O
+        conn.pragma_update(None, "wal_autocheckpoint", 1000)?; // checkpoint every 1000 pages
+
+        // Forward-only migration system.
+        //
+        // `PRAGMA user_version` records the schema version the database is
+        // currently at. On a fresh database (version 0) we apply the full
+        // SCHEMA_SQL (which is migration v1) and jump straight to
+        // LATEST_USER_VERSION. On an existing database we apply any
+        // migrations whose target_version is greater than the current
+        // user_version, updating user_version after each one.
+        let current_version: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0);
+
+        if current_version == 0 {
+            // Fresh database — apply the base schema (migration v1) and any
+            // subsequent migrations.
+            conn.execute_batch(SCHEMA_SQL)?;
+            // Apply migrations beyond v1 if any exist.
+            for &(target_version, sql) in MIGRATIONS.iter() {
+                if target_version > 1 {
+                    conn.execute_batch(sql).map_err(|e| StorageError::MigrationFailed {
+                        from: (target_version - 1) as u32,
+                        to: target_version as u32,
+                        detail: e.to_string(),
+                    })?;
+                }
+            }
+            conn.pragma_update(None, "user_version", LATEST_USER_VERSION)?;
+        } else if current_version < LATEST_USER_VERSION {
+            // Existing database — apply pending migrations in order.
+            for &(target_version, sql) in MIGRATIONS.iter() {
+                if target_version > current_version {
+                    conn.execute_batch(sql).map_err(|e| StorageError::MigrationFailed {
+                        from: current_version as u32,
+                        to: target_version as u32,
+                        detail: e.to_string(),
+                    })?;
+                    conn.pragma_update(None, "user_version", target_version)?;
+                }
+            }
+        }
+        // If current_version == LATEST_USER_VERSION, no work to do.
+
+        Ok(())
+    }
+
+    /// Initialize a read-only connection with the key and safe pragmas.
+    /// Does not set journal_mode (requires write access) or create schema
+    /// (already created by the write connection).
+    fn init_read_connection(conn: &Connection, key: &[u8; 32]) -> Result<(), StorageError> {
+        let key_hex = hex::encode(key);
+        conn.pragma_update(None, "key", &key_hex)?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "cache_size", -65536)?; // 64MB cache
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "mmap_size", 268435456)?; // 256MB
         Ok(())
     }
 
@@ -56,12 +149,34 @@ impl LocalStoreDb {
     }
 
     /// Get a lock for read-only operations.
-    /// Currently uses the same connection as write, but this is the seam
-    /// where a read-only connection pool would be used in production.
+    /// Uses the read-only connection pool (round-robin) for file-based DBs.
+    /// Falls back to the write connection for in-memory databases.
     pub fn read(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StorageError> {
-        self.write_conn
+        if self.read_conns.is_empty() {
+            return self
+                .write_conn
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned("LocalStoreDb"));
+        }
+        let mut idx_guard = self
+            .read_idx
             .lock()
-            .map_err(|_| StorageError::LockPoisoned("LocalStoreDb"))
+            .map_err(|_| StorageError::LockPoisoned("LocalStoreDb"))?;
+        let i = *idx_guard % self.read_conns.len();
+        *idx_guard = idx_guard.wrapping_add(1);
+        let conn = self.read_conns[i]
+            .lock()
+            .map_err(|_| StorageError::LockPoisoned("LocalStoreDb"))?;
+        drop(idx_guard);
+        Ok(conn)
+    }
+
+    /// Run `PRAGMA wal_checkpoint(TRUNCATE)` on the write connection to
+    /// truncate the WAL file back into the main database.
+    pub fn checkpoint(&self) -> Result<(), StorageError> {
+        let conn = self.write()?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        Ok(())
     }
 
     /// Insert a conversation.
@@ -167,7 +282,7 @@ impl LocalStoreDb {
              ORDER BY created_at_ms DESC LIMIT ?2"
         };
 
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare_cached(sql)?;
 
         let mut result = Vec::new();
         if let Some(before) = before_ms {
@@ -193,7 +308,7 @@ impl LocalStoreDb {
     /// Fetch a message body by message ID.
     pub fn fetch_body(&self, message_id: &str) -> Result<Option<super::MessageBody>, StorageError> {
         let conn = self.read()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT message_id, text_content, detected_language, rich_meta FROM message_body WHERE message_id = ?1",
         )?;
         let result = stmt
@@ -219,6 +334,54 @@ impl LocalStoreDb {
         Ok(())
     }
 
+    /// Batch-fetch text content for multiple message IDs in a single query.
+    /// Returns a map of message_id → text_content for messages that have text.
+    /// Used to avoid N+1 queries when generating search snippets.
+    pub fn fetch_bodies_batch(
+        &self,
+        message_ids: &[String],
+    ) -> Result<HashMap<String, String>, StorageError> {
+        if message_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // SQLite has a ~999 parameter limit. Guard against exceeding it.
+        const MAX_BATCH_PARAMS: usize = 900;
+        if message_ids.len() > MAX_BATCH_PARAMS {
+            return Err(StorageError::Custom(format!(
+                "batch size {} exceeds SQLite parameter limit",
+                message_ids.len()
+            )));
+        }
+        let conn = self.read()?;
+        let placeholders = (0..message_ids.len())
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT message_id, text_content FROM message_body WHERE message_id IN ({})",
+            placeholders
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = message_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        })?;
+        let mut result = HashMap::new();
+        for row in rows {
+            let (id, text) = row?;
+            if let Some(text) = text {
+                result.insert(id, text);
+            }
+        }
+        Ok(result)
+    }
+
     /// Search FTS5 for text content.
     #[allow(clippy::type_complexity)]
     pub fn search_fts(
@@ -230,7 +393,7 @@ impl LocalStoreDb {
             return Ok(Vec::new());
         }
         let conn = self.read()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT message_id, conversation_id, sender_id, created_at_ms, rank
              FROM search_fts WHERE search_fts MATCH ?1 ORDER BY rank LIMIT ?2",
         )?;
@@ -263,7 +426,7 @@ impl LocalStoreDb {
             return Ok(Vec::new());
         }
         let conn = self.read()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT message_id, conversation_id, sender_id, created_at_ms, rank
              FROM search_fts WHERE search_fts MATCH ?1 AND conversation_id = ?2
              ORDER BY rank LIMIT ?3",
@@ -423,7 +586,7 @@ impl LocalStoreDb {
         limit: usize,
     ) -> Result<Vec<(String, i64, i64)>, StorageError> {
         let conn = self.read()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT asset_id, bytes_local, bytes_total
              FROM media_asset
              WHERE media_state = 'original_local' AND bytes_local > 0
@@ -449,7 +612,7 @@ impl LocalStoreDb {
         limit: usize,
     ) -> Result<Vec<(String, i64, i64)>, StorageError> {
         let conn = self.read()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT mb.message_id, length(mb.text_content), ms.created_at_ms
              FROM message_body mb
              JOIN message_skeleton ms ON mb.message_id = ms.message_id
@@ -605,7 +768,7 @@ impl LocalStoreDb {
         message_id: &str,
     ) -> Result<Vec<super::MediaAsset>, StorageError> {
         let conn = self.read()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT asset_id, message_id, mime_type, bytes_total, bytes_local, media_state,
                     wrapped_k_asset, chunk_count, merkle_root, blob_id, storage_sink
              FROM media_asset WHERE message_id = ?1",
@@ -654,7 +817,7 @@ impl LocalStoreDb {
     /// List all conversations (for backup serialization).
     pub fn list_all_conversations(&self) -> Result<Vec<super::Conversation>, StorageError> {
         let conn = self.read()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT conversation_id, title_cipher, pinned, muted, last_message_id,
                     last_activity_ms, conversation_type, scope, tenant_id, community_id, domain_id
              FROM conversation",
@@ -684,7 +847,7 @@ impl LocalStoreDb {
     /// List all message skeletons (for backup serialization).
     pub fn list_all_skeletons(&self) -> Result<Vec<super::MessageSkeleton>, StorageError> {
         let conn = self.read()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT message_id, conversation_id, sender_id, created_at_ms, received_at_ms,
                     kind, body_state, media_state, archive_state, backup_state,
                     reply_to, edited_at_ms, deleted_at_ms
@@ -726,7 +889,7 @@ impl LocalStoreDb {
     /// List only skeletons that haven't been backed up yet (incremental backup).
     pub fn list_skeletons_for_backup(&self) -> Result<Vec<super::MessageSkeleton>, StorageError> {
         let conn = self.read()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT message_id, conversation_id, sender_id, created_at_ms, received_at_ms,
                     kind, body_state, media_state, archive_state, backup_state,
                     reply_to, edited_at_ms, deleted_at_ms
@@ -769,10 +932,88 @@ impl LocalStoreDb {
     /// List all message bodies (for backup serialization).
     pub fn list_all_bodies(&self) -> Result<Vec<super::MessageBody>, StorageError> {
         let conn = self.read()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT message_id, text_content, detected_language, rich_meta FROM message_body",
         )?;
         let rows = stmt.query_map([], |row| {
+            Ok(super::MessageBody {
+                message_id: row.get(0)?,
+                text_content: row.get(1)?,
+                detected_language: row.get(2)?,
+                rich_meta: row.get(3)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// List skeletons for backup in batches (C3: streaming backup support).
+    /// Uses LIMIT/OFFSET to fetch only `limit` rows starting at `offset`.
+    pub fn list_skeletons_for_backup_batch(
+        &self,
+        limit: usize,
+        offset: i64,
+    ) -> Result<Vec<super::MessageSkeleton>, StorageError> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT message_id, conversation_id, sender_id, created_at_ms, received_at_ms,
+                    kind, body_state, media_state, archive_state, backup_state,
+                    reply_to, edited_at_ms, deleted_at_ms
+             FROM message_skeleton
+             WHERE backup_state = 'not_backed_up'
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64, offset], |row| {
+            let kind_str: String = row.get(5)?;
+            let body_state_str: String = row.get(6)?;
+            let media_state_str: Option<String> = row.get(7)?;
+            let archive_state_str: String = row.get(8)?;
+            let backup_state_str: String = row.get(9)?;
+            Ok(super::MessageSkeleton {
+                message_id: row.get(0)?,
+                conversation_id: row.get(1)?,
+                sender_id: row.get(2)?,
+                created_at_ms: row.get(3)?,
+                received_at_ms: row.get(4)?,
+                kind: super::MessageKind::parse(&kind_str),
+                body_state: BodyState::from_str(&body_state_str)
+                    .unwrap_or(BodyState::Unavailable),
+                media_state: media_state_str
+                    .as_deref()
+                    .and_then(|s| MediaState::from_str(s).ok()),
+                archive_state: ArchiveState::from_str(&archive_state_str)
+                    .unwrap_or(ArchiveState::NotArchived),
+                backup_state: super::state_machines::BackupState::from_str(&backup_state_str)
+                    .unwrap_or(super::state_machines::BackupState::NotBackedUp),
+                reply_to: row.get(10)?,
+                edited_at_ms: row.get(11)?,
+                deleted_at_ms: row.get(12)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// List message bodies in batches (C3: streaming backup support).
+    /// Uses LIMIT/OFFSET to fetch only `limit` rows starting at `offset`.
+    pub fn list_all_bodies_batch(
+        &self,
+        limit: usize,
+        offset: i64,
+    ) -> Result<Vec<super::MessageBody>, StorageError> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT message_id, text_content, detected_language, rich_meta
+             FROM message_body
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64, offset], |row| {
             Ok(super::MessageBody {
                 message_id: row.get(0)?,
                 text_content: row.get(1)?,
@@ -806,7 +1047,7 @@ impl LocalStoreDb {
         let mut conn = self.write()?;
         let tx = conn.transaction()?;
         {
-            let mut stmt = tx.prepare(
+            let mut stmt = tx.prepare_cached(
                 "UPDATE message_skeleton SET backup_state = 'backup_manifest_committed' WHERE message_id = ?1",
             )?;
             for id in message_ids {
@@ -830,23 +1071,80 @@ impl LocalStoreDb {
         // Insert FTS5 row
         self.index_fts(message_id, conversation_id, sender_id, created_at_ms, text)?;
 
-        // Insert fuzzy tokens
+        // Insert fuzzy tokens in a single transaction (M20: batch insert)
         let tokens = crate::search::tokenizer::tokenize(text);
-        for (token, script) in &tokens {
-            let grams = match script {
-                crate::search::tokenizer::Script::Hani
-                | crate::search::tokenizer::Script::Hira
-                | crate::search::tokenizer::Script::Kana
-                | crate::search::tokenizer::Script::Hang => {
-                    crate::search::tokenizer::bigrams(token)
+        let mut conn = self.write()?;
+        let tx = conn.transaction()?;
+        {
+            for (token, script) in &tokens {
+                let grams = match script {
+                    crate::search::tokenizer::Script::Hani
+                    | crate::search::tokenizer::Script::Hira
+                    | crate::search::tokenizer::Script::Kana
+                    | crate::search::tokenizer::Script::Hang => {
+                        crate::search::tokenizer::bigrams(token)
+                    }
+                    _ => crate::search::tokenizer::trigrams(token),
+                };
+                for gram in &grams {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO search_fuzzy (token, script, message_id) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![gram, script.code(), message_id],
+                    )?;
                 }
-                _ => crate::search::tokenizer::trigrams(token),
-            };
-            for gram in &grams {
-                self.index_fuzzy(gram, script.code(), message_id)?;
             }
         }
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Prune backup event journal entries older than the given timestamp.
+    /// Returns the number of rows deleted.
+    pub fn prune_backup_events(&self, before_ms: i64) -> Result<usize, StorageError> {
+        let conn = self.write()?;
+        let count = conn.execute(
+            "DELETE FROM backup_event_journal WHERE created_at_ms < ?1",
+            rusqlite::params![before_ms],
+        )?;
+        Ok(count)
+    }
+
+    /// Save backup coordinator state (current_generation, prev_manifest_hash)
+    /// to the `backup_state` table. Uses INSERT OR REPLACE for upsert semantics.
+    pub fn save_backup_state(
+        &self,
+        current_generation: u64,
+        prev_manifest_hash: &[u8; 32],
+    ) -> Result<(), StorageError> {
+        let conn = self.write()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO backup_state (id, current_generation, prev_manifest_hash)
+             VALUES (1, ?1, ?2)",
+            rusqlite::params![current_generation as i64, prev_manifest_hash.to_vec()],
+        )?;
+        Ok(())
+    }
+
+    /// Load backup coordinator state from the `backup_state` table.
+    /// Returns `None` if no state has been persisted yet.
+    pub fn load_backup_state(&self) -> Result<Option<(u64, [u8; 32])>, StorageError> {
+        let conn = self.read()?;
+        let result = conn
+            .query_row(
+                "SELECT current_generation, prev_manifest_hash FROM backup_state WHERE id = 1",
+                [],
+                |row| {
+                    let gen: i64 = row.get(0)?;
+                    let hash_vec: Vec<u8> = row.get(1)?;
+                    let mut hash = [0u8; 32];
+                    if hash_vec.len() == 32 {
+                        hash.copy_from_slice(&hash_vec);
+                    }
+                    Ok((gen as u64, hash))
+                },
+            )
+            .ok();
+        Ok(result)
     }
 
     /// Clear all message-related data (for restore pre-clean).

@@ -31,8 +31,11 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default maximum retry attempts for transient failures.
 const DEFAULT_MAX_RETRIES: u32 = 3;
 
-/// Base delay for exponential backoff (100ms → 200ms → 400ms).
-const BASE_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// Default base delay for exponential backoff (100ms → 200ms → 400ms).
+const DEFAULT_BASE_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// M11: Cap retry backoff at 30 seconds to prevent excessive blocking.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 /// HTTP-based transport that talks to the kdrive Go gateway.
 #[derive(Debug)]
@@ -43,7 +46,10 @@ pub struct KdriveTransport {
     user_id: String,
     client: Arc<reqwest::blocking::Client>,
     breaker: CircuitBreaker,
+    /// M7: Configurable maximum retry attempts.
     max_retries: u32,
+    /// M7: Configurable base delay for exponential backoff.
+    base_retry_delay: Duration,
 }
 
 impl KdriveTransport {
@@ -65,6 +71,7 @@ impl KdriveTransport {
             client: Arc::new(client),
             breaker: CircuitBreaker::new(5).with_recovery_timeout(Duration::from_secs(30)),
             max_retries: DEFAULT_MAX_RETRIES,
+            base_retry_delay: DEFAULT_BASE_RETRY_DELAY,
         }
     }
 
@@ -81,6 +88,12 @@ impl KdriveTransport {
     /// Set the maximum number of retry attempts for transient failures.
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
+        self
+    }
+
+    /// Set the base delay for exponential backoff (M7: configurable retry).
+    pub fn with_base_retry_delay(mut self, base_retry_delay: Duration) -> Self {
+        self.base_retry_delay = base_retry_delay;
         self
     }
 
@@ -133,7 +146,8 @@ impl KdriveTransport {
                     if is_retryable_status(status) && attempt < self.max_retries {
                         self.breaker.record_failure();
                         last_err = err;
-                        let delay = BASE_RETRY_DELAY * 2u32.saturating_pow(attempt);
+                        // M11: cap delay at 30 seconds
+                        let delay = (self.base_retry_delay * 2u32.saturating_pow(attempt)).min(MAX_RETRY_DELAY);
                         std::thread::sleep(delay);
                         continue;
                     }
@@ -148,7 +162,8 @@ impl KdriveTransport {
                     let err = TransportError::Network(e.to_string());
                     if attempt < self.max_retries {
                         last_err = err;
-                        let delay = BASE_RETRY_DELAY * 2u32.saturating_pow(attempt);
+                        // M11: cap delay at 30 seconds
+                        let delay = (self.base_retry_delay * 2u32.saturating_pow(attempt)).min(MAX_RETRY_DELAY);
                         std::thread::sleep(delay);
                         continue;
                     }

@@ -79,78 +79,120 @@ impl RestorePipeline {
         // 4. Set up epoch key manager for decryption
         let epoch_mgr = EpochKeyManager::new(wrapping_key);
 
-        // 5. Download and decrypt backup segments
-        let mut all_payloads: Vec<Vec<u8>> = Vec::new();
+        // 5. Wrap the clear + restore in a SAVEPOINT so that if any segment
+        //    fails to download/decrypt/insert, we roll back to the pre-clear
+        //    state and the old data is preserved rather than leaving the DB
+        //    empty.
+        let restore_conn = db.write()?;
+        restore_conn
+            .execute_batch("SAVEPOINT cs_restore;")
+            .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
 
-        for manifest in &manifests {
-            for seg_ref in &manifest.segments {
-                let seg_id_str = seg_ref.segment_id.to_string();
-                let ciphertext = transport
-                    .download_backup_segment(&seg_id_str)
-                    .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
-
-                // Derive segment key from epoch key
-                let epoch_key = epoch_mgr.current_epoch_key();
-                let segment_key = crate::crypto::key_bridge::derive_archive_segment(
-                    &epoch_key,
-                    seg_ref.segment_id.as_bytes(),
-                );
-
-                // Decrypt backup segment (self-contained frame: nonce + ciphertext)
-                match open_segment(&ciphertext, &segment_key) {
-                    Ok(plaintext) => all_payloads.push(plaintext),
-                    Err(e) => {
-                        return Err(crate::Error::Storage(
-                            format!("backup segment decryption failed for {seg_id_str}: {e}")
-                                .into(),
-                        ));
-                    }
-                }
-            }
+        // 6. Clear existing data before restore to avoid silent merges.
+        let clear_result: Result<(), rusqlite::Error> = restore_conn.execute_batch(
+            "DELETE FROM search_fts;
+             DELETE FROM search_fuzzy;
+             DELETE FROM message_body;
+             DELETE FROM media_asset;
+             DELETE FROM message_skeleton;
+             DELETE FROM conversation;
+             DELETE FROM backup_event_journal;
+             DELETE FROM outbox;",
+        );
+        if let Err(e) = clear_result {
+            let _ = restore_conn.execute_batch("ROLLBACK TO cs_restore; RELEASE cs_restore;");
+            drop(restore_conn);
+            return Err(crate::Error::Storage(e.to_string().into()));
         }
+        drop(restore_conn);
 
-        // 6. Clear existing data before restore to avoid silent merges
-        db.clear_all_message_data()?;
-
-        // 7. Deserialize backup snapshots from decrypted payloads and insert into DB
+        // 7. Download, decrypt, and insert each segment immediately (C4: streaming restore).
+        //    Each segment is processed and dropped before downloading the next,
+        //    so we never hold more than one segment's payload in memory.
+        //    If any step fails, we roll back the SAVEPOINT to restore old data.
         self.transition(RestoreState::SkeletonRestored)?;
 
         let mut messages_restored = 0usize;
         let mut conversations_restored = 0usize;
         let mut search_indexes_rebuilt = 0usize;
 
-        for payload_bytes in &all_payloads {
-            let snapshot = BackupSnapshot::from_cbor(payload_bytes)?;
+        let restore_result: Result<(), crate::Error> = (|| {
+            for manifest in &manifests {
+                for seg_ref in &manifest.segments {
+                    let seg_id_str = seg_ref.segment_id.to_string();
+                    let ciphertext = transport
+                        .download_backup_segment(&seg_id_str)
+                        .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
 
-            // Insert conversations
-            for conv in &snapshot.conversations {
-                db.insert_conversation(conv)?;
-                conversations_restored += 1;
-            }
+                    // Derive segment key from epoch key
+                    let epoch_key = epoch_mgr.current_epoch_key();
+                    let segment_key = crate::crypto::key_bridge::derive_archive_segment(
+                        &epoch_key,
+                        seg_ref.segment_id.as_bytes(),
+                    );
 
-            // Insert skeletons
-            for skel in &snapshot.skeletons {
-                db.insert_skeleton(skel)?;
-                messages_restored += 1;
-            }
+                    // Decrypt backup segment (self-contained frame: nonce + ciphertext)
+                    let plaintext = match open_segment(&ciphertext, &segment_key) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return Err(crate::Error::Storage(
+                                format!("backup segment decryption failed for {seg_id_str}: {e}")
+                                    .into(),
+                            ));
+                        }
+                    };
 
-            // Insert bodies and rebuild search indexes
-            for body in &snapshot.bodies {
-                db.insert_body(body)?;
-                if let Some(ref text) = body.text_content {
-                    // Find the skeleton to get conversation_id, sender_id, created_at_ms
-                    if let Ok(Some(skel)) = db.get_message_skeleton(&body.message_id) {
-                        db.reindex_message(
-                            &body.message_id,
-                            &skel.conversation_id,
-                            &skel.sender_id,
-                            skel.created_at_ms,
-                            text,
-                        )?;
-                        search_indexes_rebuilt += 1;
+                    // Deserialize and insert immediately, then drop the payload
+                    let snapshot = BackupSnapshot::from_cbor(&plaintext)?;
+                    drop(plaintext);
+
+                    // Insert conversations
+                    for conv in &snapshot.conversations {
+                        db.insert_conversation(conv)?;
+                        conversations_restored += 1;
                     }
+
+                    // Insert skeletons
+                    for skel in &snapshot.skeletons {
+                        db.insert_skeleton(skel)?;
+                        messages_restored += 1;
+                    }
+
+                    // Insert bodies and rebuild search indexes
+                    for body in &snapshot.bodies {
+                        db.insert_body(body)?;
+                        if let Some(ref text) = body.text_content {
+                            // Find the skeleton to get conversation_id, sender_id, created_at_ms
+                            if let Ok(Some(skel)) = db.get_message_skeleton(&body.message_id) {
+                                db.reindex_message(
+                                    &body.message_id,
+                                    &skel.conversation_id,
+                                    &skel.sender_id,
+                                    skel.created_at_ms,
+                                    text,
+                                )?;
+                                search_indexes_rebuilt += 1;
+                            }
+                        }
+                    }
+                    // snapshot and all its data are dropped here
                 }
             }
+            Ok(())
+        })();
+
+        if let Err(e) = restore_result {
+            // Roll back the SAVEPOINT to undo the clear and any partial inserts,
+            // restoring the pre-restore database state.
+            if let Ok(conn) = db.write() {
+                let _ = conn.execute_batch("ROLLBACK TO cs_restore; RELEASE cs_restore;");
+            }
+            return Err(e);
+        }
+
+        // Release the SAVEPOINT — all changes (clear + restore) are committed.
+        if let Ok(conn) = db.write() {
+            let _ = conn.execute_batch("RELEASE cs_restore;");
         }
 
         // 8. Advance through remaining states

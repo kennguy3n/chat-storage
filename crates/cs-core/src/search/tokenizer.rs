@@ -83,7 +83,8 @@ pub fn bigrams(token: &str) -> Vec<String> {
 /// Tokenize text into script-tagged tokens.
 pub fn tokenize(text: &str) -> Vec<(String, Script)> {
     let mut tokens = Vec::new();
-    let mut current = String::new();
+    // M14: pre-allocate to avoid repeated reallocations
+    let mut current = String::with_capacity(text.len());
     let mut current_script = Script::Latn;
 
     for c in text.chars() {

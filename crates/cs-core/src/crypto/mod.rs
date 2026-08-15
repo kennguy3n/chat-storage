@@ -36,6 +36,12 @@ pub use key_bridge::{
 };
 pub use key_wrap::{unwrap_key, wrap_key};
 
+// m1: Zeroize support for key material.
+// `Key32` is `[u8; 32]`, which already implements `zeroize::Zeroize` via the
+// blanket impl for byte arrays. Re-export `Zeroizing` so callers can wrap
+// keys for automatic zeroization on drop.
+pub use zeroize::Zeroizing;
+
 /// Crypto errors.
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
