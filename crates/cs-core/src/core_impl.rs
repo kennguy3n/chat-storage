@@ -57,7 +57,7 @@ impl CoreImpl {
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
 
-        let db_key = key_bridge::derive_local_db_key(&wrapping_key);
+        let db_key = key_bridge::derive_local_db_key(&wrapping_key)?;
         let db = Arc::new(LocalStoreDb::open(&db_path_str, &db_key)?);
         let query_engine = QueryEngine::new(db.clone());
 
@@ -152,13 +152,19 @@ impl CoreImpl {
                             .unwrap_or_default()
                             .as_millis() as i64;
                         let should_enforce = {
-                            let guard = self.last_enforcement_ms.lock().unwrap();
+                            let guard = self
+                                .last_enforcement_ms
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
                             guard.map_or(true, |last| now - last > 60_000)
                         };
                         if should_enforce {
                             let _ =
                                 self.enforce_storage_budget(StoragePressureReason::BudgetThreshold);
-                            *self.last_enforcement_ms.lock().unwrap() = Some(now);
+                            *self
+                                .last_enforcement_ms
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = Some(now);
                         }
                     }
                 }
@@ -238,7 +244,7 @@ impl CoreImpl {
         &self,
         _reason: BackupReason,
     ) -> Result<BackupResult, crate::Error> {
-        let backup_key = key_bridge::derive_backup_root(&self.wrapping_key);
+        let backup_key = key_bridge::derive_backup_root(&self.wrapping_key)?;
 
         // Collect actual data from the local store — serialize conversations,
         // message skeletons, and bodies into a CBOR backup snapshot.
@@ -381,7 +387,7 @@ impl CoreImpl {
             .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
 
         // Derive vault master key from wrapping key (never persisted to disk)
-        let vault_master_key = key_bridge::derive_local_db_key(&self.wrapping_key);
+        let vault_master_key = key_bridge::derive_local_db_key(&self.wrapping_key)?;
 
         // Load existing vault entries from disk (if any), then add new key
         let vault_path = self.config.data_dir.join("device_vault.bin");
@@ -497,8 +503,8 @@ impl CoreImpl {
 
         // Encrypt the media plaintext using a per-asset media key
         // derived from K_media_root (separate from archive key hierarchy)
-        let media_root = key_bridge::derive_media_root(&self.wrapping_key);
-        let media_key = key_bridge::derive_media_blob(&media_root, asset_id.as_bytes());
+        let media_root = key_bridge::derive_media_root(&self.wrapping_key)?;
+        let media_key = key_bridge::derive_media_blob(&media_root, asset_id.as_bytes())?;
         let nonce = crate::crypto::aead::random_nonce_24();
         let ciphertext = crate::crypto::seal(
             &media_key,

@@ -77,7 +77,7 @@ impl RestorePipeline {
         self.transition(RestoreState::ManifestVerified)?;
 
         // 4. Set up epoch key manager for decryption
-        let epoch_mgr = EpochKeyManager::new(wrapping_key);
+        let epoch_mgr = EpochKeyManager::new(wrapping_key)?;
 
         // 5. Wrap the clear + restore in a SAVEPOINT so that if any segment
         //    fails to download/decrypt/insert, we roll back to the pre-clear
@@ -125,11 +125,11 @@ impl RestorePipeline {
                         .map_err(|e| crate::Error::Storage(e.to_string().into()))?;
 
                     // Derive segment key from epoch key
-                    let epoch_key = epoch_mgr.current_epoch_key();
+                    let epoch_key = epoch_mgr.current_epoch_key()?;
                     let segment_key = crate::crypto::key_bridge::derive_archive_segment(
                         &epoch_key,
                         seg_ref.segment_id.as_bytes(),
-                    );
+                    )?;
 
                     // Decrypt backup segment (self-contained frame: nonce + ciphertext)
                     let plaintext = match open_segment(&ciphertext, &segment_key) {

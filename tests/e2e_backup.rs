@@ -12,7 +12,7 @@ use cs_core::transport::ChatStorageTransport;
 #[test]
 fn b2c_backup_incremental() {
     let mut coord = BackupCoordinator::new();
-    let _backup_key = key_bridge::derive_backup_root(&[0x42u8; 32]);
+    let _backup_key = key_bridge::derive_backup_root(&[0x42u8; 32]).unwrap();
 
     // We can't test with real transport here (no gateway), but we can verify
     // the coordinator state transitions
@@ -46,7 +46,7 @@ fn b2c_backup_manifest_chain_integrity() {
 
 #[test]
 fn b2c_backup_segment_encrypted() {
-    let backup_key = key_bridge::derive_backup_root(&[0x42u8; 32]);
+    let backup_key = key_bridge::derive_backup_root(&[0x42u8; 32]).unwrap();
     let plaintext = b"sensitive backup data with secrets";
 
     let (frame, _nonce, hash) = build_segment(plaintext, &backup_key).expect("build failed");
@@ -112,7 +112,7 @@ fn b2b_backup_tenant_isolation() {
         "user-b".to_string(),
     );
 
-    let backup_key = key_bridge::derive_backup_root(&tenant_wrapping_key("tenant-a"));
+    let backup_key = key_bridge::derive_backup_root(&tenant_wrapping_key("tenant-a")).unwrap();
     let mut coord = BackupCoordinator::new();
 
     let data = b"tenant A backup data";

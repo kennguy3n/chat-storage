@@ -25,8 +25,8 @@ fn make_test_messages(count: usize, conv_id: &str) -> Vec<IngestedMessage> {
 #[test]
 fn b2c_archive_segment_roundtrip() {
     let wrapping_key = [0x42u8; 32];
-    let epoch_mgr = EpochKeyManager::new(&wrapping_key);
-    let segment_key = epoch_mgr.current_epoch_key();
+    let epoch_mgr = EpochKeyManager::new(&wrapping_key).unwrap();
+    let segment_key = epoch_mgr.current_epoch_key().unwrap();
 
     let messages = make_test_messages(10, "conv-arch");
     let frame = build_segment(&messages, "conv-arch", "2024-01", 1, &segment_key)
@@ -46,8 +46,8 @@ fn b2c_archive_segment_roundtrip() {
 #[test]
 fn b2c_archive_compression() {
     let wrapping_key = [0x42u8; 32];
-    let epoch_mgr = EpochKeyManager::new(&wrapping_key);
-    let segment_key = epoch_mgr.current_epoch_key();
+    let epoch_mgr = EpochKeyManager::new(&wrapping_key).unwrap();
+    let segment_key = epoch_mgr.current_epoch_key().unwrap();
 
     // Large repetitive text should compress well
     let messages = vec![IngestedMessage {
@@ -76,15 +76,15 @@ fn b2c_archive_compression() {
 #[test]
 fn b2c_archive_epoch_key_rotation() {
     let wrapping_key = [0x42u8; 32];
-    let mut mgr = EpochKeyManager::new(&wrapping_key);
+    let mut mgr = EpochKeyManager::new(&wrapping_key).unwrap();
 
-    let key1 = mgr.current_epoch_key();
+    let key1 = mgr.current_epoch_key().unwrap();
     assert!(!key1.iter().all(|&b| b == 0));
 
     // Rotate — wraps old key, derives new
     mgr.rotate().expect("rotate failed");
 
-    let key2 = mgr.current_epoch_key();
+    let key2 = mgr.current_epoch_key().unwrap();
     assert_ne!(key1, key2, "epoch key should change after rotation");
 
     // Old key should be recoverable from wrapped prior epochs
@@ -103,7 +103,7 @@ fn b2c_archive_epoch_key_rotation() {
 #[test]
 fn b2c_archive_manifest_chain() {
     let wrapping_key = [0x42u8; 32];
-    let _archive_root = key_bridge::derive_archive_root(&wrapping_key);
+    let _archive_root = key_bridge::derive_archive_root(&wrapping_key).unwrap();
 
     // Simulate 3 manifest generations
     let mut prev_hash = [0u8; 32];
@@ -142,7 +142,7 @@ fn b2c_archive_single_batch() {
         "user-a".to_string(),
     );
 
-    let mut coord = ArchiveCoordinator::new(&tenant_wrapping_key("tenant-a"));
+    let mut coord = ArchiveCoordinator::new(&tenant_wrapping_key("tenant-a")).unwrap();
     let messages = make_test_messages(10, "conv-arch-e2e");
 
     let segment_id = coord
@@ -171,7 +171,7 @@ fn b2b_archive_tenant_isolation() {
         "user-b".to_string(),
     );
 
-    let mut coord_a = ArchiveCoordinator::new(&tenant_wrapping_key("tenant-a"));
+    let mut coord_a = ArchiveCoordinator::new(&tenant_wrapping_key("tenant-a")).unwrap();
     let messages = make_test_messages(5, "conv-iso-arch");
 
     let segment_id = coord_a

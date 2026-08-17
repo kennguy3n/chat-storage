@@ -28,14 +28,14 @@ pub struct ArchiveCoordinator {
 const MAX_PENDING_SEGMENTS: usize = 100;
 
 impl ArchiveCoordinator {
-    pub fn new(wrapping_key: &[u8; 32]) -> Self {
-        Self {
-            epoch_manager: EpochKeyManager::new(wrapping_key),
+    pub fn new(wrapping_key: &[u8; 32]) -> Result<Self, crate::Error> {
+        Ok(Self {
+            epoch_manager: EpochKeyManager::new(wrapping_key)?,
             event_journal: ArchiveEventJournal::new(),
-            pending_segments: Vec::new(),
+            pending_segments: Vec::with_capacity(MAX_PENDING_SEGMENTS),
             current_generation: 0,
             prev_manifest_hash: [0u8; 32],
-        }
+        })
     }
 
     /// Archive a batch of messages: build segment, upload, and queue for manifest.
@@ -47,7 +47,7 @@ impl ArchiveCoordinator {
         transport: &dyn ChatStorageTransport,
     ) -> Result<String, crate::Error> {
         let epoch_id = self.epoch_manager.current_epoch();
-        let segment_key = self.epoch_manager.current_epoch_key();
+        let segment_key = self.epoch_manager.current_epoch_key()?;
 
         // Build the encrypted segment
         let frame = build_segment(

@@ -48,6 +48,9 @@ pub fn fuzzy_search(
         .map_err(|e| SearchError::Custom(e.to_string()))?;
 
     let query_lower = query.to_lowercase();
+    // Pre-convert the query to char slices once so Levenshtein does not
+    // re-allocate Vec<char> on every candidate.
+    let query_chars: Vec<char> = query_lower.chars().collect();
 
     // Collect candidates into a map keyed by message_id to deduplicate
     // (multiple n-grams may match the same message).

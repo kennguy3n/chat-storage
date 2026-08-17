@@ -13,13 +13,13 @@ pub struct EpochKeyManager {
 }
 
 impl EpochKeyManager {
-    pub fn new(wrapping_key: &Key32) -> Self {
-        let archive_root = key_bridge::derive_archive_root(wrapping_key);
-        Self {
+    pub fn new(wrapping_key: &Key32) -> Result<Self, crate::crypto::CryptoError> {
+        let archive_root = key_bridge::derive_archive_root(wrapping_key)?;
+        Ok(Self {
             archive_root,
             current_epoch: current_epoch_id(),
             wrapped_prior_epochs: Vec::new(),
-        }
+        })
     }
 
     /// Get the current epoch ID.
@@ -28,17 +28,14 @@ impl EpochKeyManager {
     }
 
     /// Get the current epoch key.
-    pub fn current_epoch_key(&self) -> Key32 {
+    pub fn current_epoch_key(&self) -> Result<Key32, crate::crypto::CryptoError> {
         key_bridge::derive_archive_epoch(&self.archive_root, self.current_epoch)
     }
 
     /// Get an epoch key for a specific epoch (from wrapped prior epochs).
     pub fn epoch_key(&self, epoch_id: u64) -> Option<Key32> {
         if epoch_id == self.current_epoch {
-            Some(key_bridge::derive_archive_epoch(
-                &self.archive_root,
-                epoch_id,
-            ))
+            key_bridge::derive_archive_epoch(&self.archive_root, epoch_id).ok()
         } else {
             // Unwrap from stored wrapped keys
             for (stored_epoch, wrapped) in &self.wrapped_prior_epochs {
@@ -52,7 +49,7 @@ impl EpochKeyManager {
 
     /// Rotate to a new epoch. Wraps the current epoch key before switching.
     pub fn rotate(&mut self) -> Result<(), crate::Error> {
-        let old_key = self.current_epoch_key();
+        let old_key = self.current_epoch_key()?;
         let wrapped = key_wrap::wrap_key(&self.archive_root, &old_key)?;
         self.wrapped_prior_epochs
             .push((self.current_epoch, wrapped));
@@ -100,8 +97,8 @@ mod tests {
 
     #[test]
     fn test_epoch_key_manager() {
-        let mgr = EpochKeyManager::new(&[0x42u8; 32]);
-        let key1 = mgr.current_epoch_key();
+        let mgr = EpochKeyManager::new(&[0x42u8; 32]).unwrap();
+        let key1 = mgr.current_epoch_key().unwrap();
         assert!(!key1.iter().all(|&b| b == 0));
     }
 }

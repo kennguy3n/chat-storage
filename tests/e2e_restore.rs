@@ -99,10 +99,10 @@ fn b2c_restore_key_recovery() {
     use cs_core::restore::key_recovery::recover_epoch_key;
 
     let wrapping_key = [0x42u8; 32];
-    let archive_root = cs_core::crypto::key_bridge::derive_archive_root(&wrapping_key);
+    let archive_root = cs_core::crypto::key_bridge::derive_archive_root(&wrapping_key).unwrap();
 
     // Create an epoch key and wrap it
-    let epoch_key = cs_core::crypto::key_bridge::derive_archive_epoch(&archive_root, 42);
+    let epoch_key = cs_core::crypto::key_bridge::derive_archive_epoch(&archive_root, 42).unwrap();
     let wrapped = key_wrap::wrap_key(&archive_root, &epoch_key).expect("wrap failed");
 
     // Recover it

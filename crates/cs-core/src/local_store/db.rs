@@ -353,6 +353,8 @@ impl LocalStoreDb {
             )));
         }
         let conn = self.read()?;
+        // Safe: only `?` placeholders are generated here; the actual values
+        // are bound via parameterized queries below (not interpolated).
         let placeholders = (0..message_ids.len())
             .map(|_| "?")
             .collect::<Vec<_>>()

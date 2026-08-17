@@ -1690,6 +1690,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.20",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -1790,10 +1791,15 @@ dependencies = [
 name = "kchat-drive-transport-core"
 version = "0.1.0"
 dependencies = [
+ "js-sys",
  "kchat-drive-types",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
