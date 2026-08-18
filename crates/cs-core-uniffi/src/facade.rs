@@ -301,6 +301,15 @@ impl ChatStorage {
     ) -> Result<(), ChatStorageError> {
         use cs_core::local_store::Conversation;
 
+        // Normalize the conversation_id to the canonical lowercase UUID form
+        // so that subsequent operations (send_text, get_timeline, etc.) — which
+        // parse the id as `Uuid` and re-serialize via `to_string()` — produce
+        // the same string and satisfy foreign-key constraints.
+        let conversation_id = match Uuid::parse_str(&conversation_id) {
+            Ok(u) => u.to_string(),
+            Err(_) => conversation_id,
+        };
+
         let conv = Conversation::legacy(
             conversation_id,
             title.map(|t| t.into_bytes()),
@@ -333,6 +342,11 @@ impl ChatStorage {
         before_ms: Option<i64>,
     ) -> Result<Vec<TimelineEntryFfi>, ChatStorageError> {
         let lim = limit.unwrap_or(50) as usize;
+        // Normalize to canonical lowercase UUID form to match what send_text stores.
+        let conversation_id = match Uuid::parse_str(&conversation_id) {
+            Ok(u) => u.to_string(),
+            Err(_) => conversation_id,
+        };
         let timeline = self
             .inner
             .db()
@@ -430,6 +444,10 @@ impl ChatStorage {
 
     /// Count messages in a conversation.
     pub fn count_messages(&self, conversation_id: String) -> Result<i64, ChatStorageError> {
+        let conversation_id = match Uuid::parse_str(&conversation_id) {
+            Ok(u) => u.to_string(),
+            Err(_) => conversation_id,
+        };
         self.inner
             .db()
             .count_messages(&conversation_id)
